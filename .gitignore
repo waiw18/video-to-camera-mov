@@ -1,0 +1,24 @@
+# 中间产物
+.probe/
+*.265
+*.264
+*.h265
+*.pcm
+*.wav
+__pycache__/
+*.pyc
+
+# 成品与测试素材（体积大，不入库）
+*.MOV
+*.MP4
+*.mov
+*.mp4
+*.NEF
+cam-tests/
+output/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
