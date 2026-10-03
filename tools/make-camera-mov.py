@@ -40,8 +40,6 @@ hevc_ps = importlib.util.module_from_spec(_ps_spec)
 _ps_spec.loader.exec_module(hevc_ps)
 
 from binpath import FFMPEG, FFPROBE
-FFMPEG = os.environ.get("CAMMOV_FFMPEG") or os.path.join(_FF, "ffmpeg.exe")
-FFPROBE = os.environ.get("CAMMOV_FFPROBE") or os.path.join(_FF, "ffprobe.exe")
 CAM_FTYP = (struct.pack(">I", 24) + b"ftyp" + b"qt  "
             + struct.pack(">I", 538315008) + b"qt  " + b"niko")
 

@@ -25,6 +25,7 @@ cj = importlib.util.module_from_spec(_s)
 _s.loader.exec_module(cj)
 
 from binpath import FFMPEG, FFPROBE
+FFPROBE = FFMPEG.replace("ffmpeg.exe", "ffprobe.exe")
 
 OK, BAD = [], []
 

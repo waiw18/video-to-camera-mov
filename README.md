@@ -9,7 +9,7 @@
 
 ## ⚠️ 先读这一段
 
-- **性能问题很大**：i5-12450H 上，**4 分钟的视频需要转换约 30 分钟**。
+- **性能问题很大**：i5-12450H 上，**4 分钟的视频需要转换约 20 分钟**（编码占 97%+）。
   预计过几天优化好并发布打包程序。
 - 本项目是 **vibe coding 的产物**。
 - **本项目内容由 AI 编写。**
@@ -55,17 +55,25 @@ $env:CAMMOV_FFPROBE = "D:\ffmpeg\bin\ffprobe.exe"
 python tools/video-to-camera-mov.py 你的视频.mp4 `
     --out DSC_0001.MOV `
     --template D:\card\DCIM\100NZ5_2\DSC_0001.MOV `
-    --preset fast
+    --preset fast --bitrate 15M
 ```
 
-### 校验（强烈建议，必须 31/31）
+**默认值就是真机验证通过的配方，不要额外加参数。** 尤其：
+
+| 不要加 | 原因 |
+|---|---|
+| `--fps source`（走 29.97）| 外部生成的 29.97 至今**没成功过**，见「已知局限」 |
+| `--duration`（截短）| 短文件快进越界时相机不夹紧，见下 |
+| `--jobs 2` 以上（分段并行）| 相机播到 20~35 秒会跳出 |
+
+### 校验（强烈建议，必须 43/43）
 
 ```powershell
 python tools/verify-output.py DSC_0001.MOV --template D:\card\DCIM\100NZ5_2\DSC_0001.MOV
 ```
 
-校验项覆盖：容器布局、轨道结构、**时长自洽**、`NCDT` 帧数与时间、
-缩略图（含**解码验证**）、**参数集与切片头 33 个字段**、整体解码。
+校验项覆盖：容器布局、轨道结构、**时长自洽**、**分块尺寸（视频/音频都必须 0.5 秒）**、
+`NCDT` 帧数与时间、缩略图（含**解码验证**）、**参数集与切片头逐字段**、整体解码。
 
 > 参数集检查会 **trace 到 P 帧**。只检查首帧（IDR）会漏掉大部分差异——
 > 本项目就因此放行过一个相机不认的文件。
@@ -79,14 +87,33 @@ python tools/copy-to-card.py --list
 
 ---
 
+## ★ 三条硬约束（每条都有真机反例）
+
+这三条是踩坑最多的地方，**改动前务必读完**：
+
+| 项 | 必须 | 违反后的现象 |
+|---|---|---|
+| **`tkhd.duration`** | **保持模板原值**（示例模板是 `228228` / `228220`），**绝对不要改成"正确值"** | 快进超过文件末尾时相机**不夹紧 → 卡死** |
+| **PTL tier** | **59.94 → `0`（Main）** | 改成 `1` → 相机直接判无效 |
+| **分块** | 每 **0.5 秒**一块（59.94 = 30 帧；音频 24,024 样本）| 按"每 30 帧"算 → 29.97 全错，播到一半跳出 |
+
+**关于 `tkhd.duration`**：它看起来"过期"（和真实时长不符），但相机把它当**可播放长度**
+来夹紧快进目标。决定性证据：一个能播的文件与一个改过该字段的文件**全文件只差 6 个字节**
+（两条轨道的 `tkhd.duration`），行为随之翻转。`verify-output.py` 已把它列为门禁项。
+
+**关于分块**：相机的规律是**每 0.5 秒**，不是"每 30 帧"。
+59.94 恰好 30 帧 = 0.5 秒，所以这个坑藏了很久；30fps 该是 15 帧一块。
+
+---
+
 ## 常用参数
 
 - `--template`：相机原片模板，**必填**
 - `--preset fast`：x265 预设。`fast` 比 `medium` 约快 2.6 倍
-- `--bitrate 40M`：码率。源是 720p 上采样时 15M 就够
+- `--bitrate 15M`：码率。源是 720p 上采样时 15M 就够
 - `--time now`：拍摄时间。默认当前时间；
   也可给 `"YYYY:MM:DD HH:MM:SS"`（本地时间）或 `keep`
-- `--duration 30` / `--start 10`：只取一段
+- `--duration 30` / `--start 10`：只取一段（注意上面的短文件限制）
 - `--no-thumbs`：不重建缩略图
 - `--size 1920x1080` / `--fps 60000/1001`
 
@@ -97,24 +124,44 @@ python tools/copy-to-card.py --list
 主链：
 
 - `tools/video-to-camera-mov.py` —— 端到端转换
-- `tools/verify-output.py` —— 校验门禁
+- `tools/verify-output.py` —— 校验门禁（43 项）
 - `tools/make-camera-mov.py` —— 只做打包（码流 + PCM → MOV）
 - `tools/hevc-ps.py` —— 位级改写 HEVC 参数集
 - `tools/camera-jpeg.py` —— 相机风格 JPEG 编码
 - `tools/boxio.py` —— MOV 盒子解析
 - `tools/binpath.py` —— ffmpeg / ffprobe 定位
 
-辅链与诊断：
+无损编辑与诊断：
 
+- `tools/cut-mov.py` —— **无损截取**（码流原样搬运，只重建容器）
 - `tools/camera-concat.py` —— 拼接相机原片（不重编码）
 - `tools/copy-to-card.py` / `tools/clear-card.py` —— 拷卡 / 清卡
 - `tools/make-variants.py` —— 批量生成参数集对齐程度不同的候选
 - `tools/psdiff.py` —— 逐字段对比两个 MOV（含 P 帧切片头）
 - `tools/ncdt-diff.py` / `tools/parse-nctg.py` —— `NCDT` 解析与对比
+- `tools/byte-dump.py` / `tools/make-byte-doc.py` —— **逐字节展开成 Markdown**
+- `tools/make-ref-doc.py` —— 从基准文件生成参数档案
+- `tools/timecmp.py` / `tools/tail-diff.py` / `tools/chunk-tile.py` / `tools/sampletable.py`
+- `tools/seek-test.py` / `tools/es-analyze.py` / `tools/patch-tkhd.py` / `tools/box-types.py`
+- `tools/camera-gop-census.py` / `tools/frame-types.py` / `tools/gop-structure.py`
+- `tools/camera-files-info.py` —— 一次列出多个相机文件的概要
 - `tools/box-tree.py` / `tools/container-compare.py` / `tools/boxdiff.py`
 - `tools/sample-diff.py` / `tools/sample-anatomy.py` / `tools/chunk-order.py`
 - `tools/hvcc-diff.py` / `tools/trace-diff.py` / `tools/sps-prefix.py` / `tools/sps-sweep.py`
 - `tools/check-candidates.py`
+
+---
+
+## 文档
+
+- **[docs/principles.md](docs/principles.md)** —— 原理详解（三层判据、字段对照、失败模式）
+- **[docs/blog-post.md](docs/blog-post.md)** —— 面向普通读者的专栏版
+- **[docs/MOV转换指南.md](docs/MOV转换指南.md)** —— 使用指南
+- **[docs/生成DSC_4521的参数.md](docs/生成DSC_4521的参数.md)** —— 基准文件完整参数档案
+- **[docs/可用文件逐字节展开.md](docs/可用文件逐字节展开.md)** —— 可用文件逐字节展开
+- **[docs/码流字段对齐-实测.md](docs/码流字段对齐-实测.md)** —— 参数集字段实测
+- **[docs/相机GOP结构-实测更正.md](docs/相机GOP结构-实测更正.md)** —— GOP 结构实测
+- **[docs/MOV与MP4结构差异.md](docs/MOV与MP4结构差异.md)** —— 容器格式差异
 
 ---
 
@@ -124,10 +171,14 @@ python tools/copy-to-card.py --list
 2. **无法使用硬件编码器**：实测 NVENC 与相机差 16 个字段，
    其中 14 个改不了（CTU、最小编码块、TU 深度、SAO、AMP、PPS 开关、HRD）
 3. **依赖相机原片作为模板**
-4. **仅验证 1080p59.94**；4K 与其他帧率未实测
-5. **存在若干未对齐项**（显式量化表、SPS 内参考图像集、一个 PPS 开关），
+4. **仅验证 1080p59.94**；4K 未实测
+5. **29.97（1080p30）暂未打通**：相机自己的 30fps 原片能播，
+   但外部生成的试过 `tier=0` 和 `tier=1` 都播不了
+6. **短文件（约 1 分钟）快进越界时相机不夹紧**；全长文件正常，
+   只影响短片段的使用体验
+7. **存在若干未对齐项**（显式量化表、SPS 内参考图像集、一个 PPS 开关），
    经验证不影响播放，属已知差异而非已解决
-6. **结论为逆向推导**，非厂商文档，**固件更新后可能失效**
+8. **结论为逆向推导**，非厂商文档，**固件更新后可能失效**
 
 ---
 
