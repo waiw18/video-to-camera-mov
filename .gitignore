@@ -15,7 +15,19 @@ __pycache__/
 *.mp4
 *.NEF
 cam-tests/
+cam-tests2/
 output/
+templates/
+
+# 打包产物（exe 上百 MB，走 Release 附件，不要入库）
+dist/
+build/
+*.spec
+
+# 内部文档（含本机路径，不要公开）
+HANDOFF/
+archive/
+交接-发布测试版.md
 
 # 编辑器 / 系统
 .vscode/
