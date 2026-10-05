@@ -17,9 +17,11 @@
 import argparse
 import datetime
 import importlib.util
+import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -43,6 +45,8 @@ from binpath import FFMPEG, FFPROBE
 # 中间文件目录：环境变量优先（exe 里 _MEIPASS 是只读临时区，要写到别处）
 PROBE = Path(os.environ.get("CAMMOV_WORK")
              or (Path(__file__).resolve().parent.parent / ".probe"))
+# 界面点"取消转换"时往这里丢一个文件；编码循环每次读进度都看一眼。
+CANCEL_FLAG = PROBE / "cancel.flag"
 
 
 def run(args, label):
@@ -54,6 +58,89 @@ def run(args, label):
     return r
 
 
+# ---- 给界面（app/main.py）用的机器可读进度行 ----------------------------------
+# 协议：以 "##CAMMOV " 开头的一行 JSON；界面按行解析，不显示在日志里。
+#   {"k":"stage","step":2,"total":6,"name":"视频编码（x265）"}   当前第几步
+#   {"k":"prog","done":101.2,"total":241.6,"pct":41.9,"speed":0.14,"eta":1003}
+#   {"k":"gate","ok":43,"bad":0}                                 门禁结果
+#   {"k":"done","out":"...","size":123}                          转换完成
+# 命令行单独跑时这些行混在日志里也无害（人看得懂）。
+def _emit(kind, **kw):
+    print("##CAMMOV " + json.dumps({"k": kind, **kw}, ensure_ascii=False),
+          flush=True)
+
+
+def _emit_prog(done, total, speed, elapsed=None):
+    pct = round(min(100.0, done / total * 100), 1) if total else None
+    eta = int((total - done) / speed) if (total and speed and speed > 0) else None
+    _emit("prog", done=round(done, 2), total=round(total, 2) if total else None,
+          pct=pct, speed=round(speed, 3) if speed else None, eta=eta,
+          elapsed=int(elapsed) if elapsed else None)
+
+
+def run_prog(args, label, total=None, throttle=0.5):
+    """跑 ffmpeg（命令里必须带 -progress pipe:1），把进度转成 ##CAMMOV 行。
+
+    编码占总耗时的 97%，没有它界面就只剩"转圈"——所以这一步必须读进度。
+    进度用 ffmpeg 的 speed（相对实时的倍数）算剩余时间，再做指数平滑，
+    免得读数每秒乱跳。
+    """
+    p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, encoding="utf-8", errors="replace")
+    err_box = []
+    th = threading.Thread(target=lambda: err_box.append(p.stderr.read() or ""),
+                          daemon=True)
+    th.start()
+    done, speed, smooth = 0.0, None, None
+    t0, t_last, frames = time.time(), 0.0, 0
+    for raw in p.stdout:
+        k, _, v = raw.strip().partition("=")
+        if k == "out_time_us":
+            try:
+                done = int(v) / 1_000_000
+            except ValueError:
+                pass
+        elif k == "frame":
+            try:
+                frames = int(v)
+            except ValueError:
+                pass
+        elif k == "speed":
+            try:
+                speed = float(v.rstrip("x"))
+            except ValueError:
+                speed = None
+        elif k == "progress" and v in ("continue", "end"):
+            if v != "end" and CANCEL_FLAG.exists():
+                # 界面点了"取消转换"：杀掉 ffmpeg，把半成品留给上层清理
+                p.terminate()
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                th.join(timeout=5)
+                CANCEL_FLAG.unlink(missing_ok=True)
+                _emit("cancelled", at=round(done, 2))
+                raise SystemExit("已取消转换")
+            now = time.time()
+            if v == "end" or now - t_last >= throttle:
+                t_last = now
+                if speed and speed > 0:
+                    smooth = speed if smooth is None else smooth * 0.7 + speed * 0.3
+                _emit_prog(done, total, smooth, now - t0)
+    p.wait()
+    th.join(timeout=5)
+    err = "".join(err_box)
+    if p.returncode != 0:
+        tail = "\n".join((err or "").splitlines()[-12:])
+        raise SystemExit(f"{label} 失败（exit {p.returncode}）:\n{tail}")
+    return done, frames
+
+
+# 流水线的 6 段。界面靠它显示"第 N/6 步"，名字由工具给出（界面不硬编码步骤名）
+STAGES = ["探测", "视频编码", "音频", "缩略图", "打包容器", "收尾"]
+
+
 class Stage:
     """分段计时：找出真正的瓶颈（全 GPU 链路实测反而比 CPU 滤镜慢，
     所以瓶颈不在编码，必须量出来）。"""
@@ -61,10 +148,14 @@ class Stage:
     def __init__(self):
         self.t = time.time()
         self.last = self.t
+        self.n = 0
 
     def mark(self, name):
         now = time.time()
+        self.n += 1
         print(f"  [用时] {name}: {now - self.last:.1f}s（累计 {now - self.t:.1f}s）")
+        _emit("stage", step=self.n, total=len(STAGES), done=name,
+              running=STAGES[self.n] if self.n < len(STAGES) else None)
         self.last = now
 
 
@@ -145,6 +236,12 @@ def main():
                     help="从第 N 秒开始截取，配合 --duration")
     ap.add_argument("--no-thumbs", action="store_true",
                     help="不重建缩略图（默认会用视频首帧重建 NCDT 里的 3 张 JPEG）")
+    ap.add_argument("--thumb-at", type=float, default=0.0,
+                    help="缩略图取第 N 秒的画面（默认 0 = 首帧，与相机原生行为一致）。"
+                         "N 是相对截取起点的偏移")
+    ap.add_argument("--thumb-image", default=None,
+                    help="直接拿这张图片当缩略图（跳过抽帧；会按 3 种尺寸缩放后"
+                         "编成相机规格 JPEG）")
     ap.add_argument("--jobs", type=int, default=1,
                     help="分段并行编码的段数。**默认 1（单进程）**——真机验证过。"
                          ">1 会快约 2 倍，但实测相机播到中途就跳出"
@@ -174,6 +271,7 @@ def main():
     pcm = PROBE / f"enc-{tag}.pcm"
 
     st = Stage()
+    _emit("stage", step=0, total=len(STAGES), done=None, running=STAGES[0])
     dur, vid_dur, has_audio = probe(src)
     st.mark("探测")
     print(f"输入: {src.name}  容器时长={dur}s  视频轨={vid_dur}s  含音频={has_audio}")
@@ -281,7 +379,8 @@ def main():
                "-color_trc", "bt709", "-colorspace", "bt709",
                "-bf", "0", "-g", "30", "-no-scenecut", "1", "-forced-idr", "1",
                "-aud", "1"]
-    cmd = [FFMPEG, "-y", "-v", "error", "-i", str(src)] + trim + [
+    cmd = [FFMPEG, "-y", "-v", "error", "-progress", "pipe:1", "-nostats",
+           "-i", str(src)] + trim + [
            "-map", "0:v:0", "-vf", vf, "-r", a.fps] + enc
     # ★ 帧数必须按时长算准，否则视频会比音频短（踩过：255 秒的片子少了 9 帧，
     #   视频 254.70 s 而音频 254.86 s，mvhd 取视频时长 → 整个文件时长不自洽）。
@@ -348,7 +447,9 @@ def main():
         print(f"  已拼接 {jobs} 段 -> {es.stat().st_size:,} B")
     else:
         cmd += ["-f", "hevc", str(es)]
-        run(cmd, "视频编码")
+        # 编码占整个转换 97% 的耗时，界面的"进度 + 预计剩余"全靠这一路进度
+        tot = min(dur, a.duration) if a.duration else dur
+        run_prog(cmd, "视频编码", total=tot)
     st.mark(f"视频编码（{a.encoder}）")
     print(f"  已编码 HEVC（{a.encoder}）: {es.stat().st_size:,} B")
 
@@ -414,16 +515,38 @@ def main():
     if not a.no_thumbs:
         from PIL import Image
         tpl_jpegs = camjpeg.ncdt_jpegs(Path(a.template).read_bytes())
+        # 取帧位置：默认首帧（与相机原生行为一致）。--thumb-at 给秒数（相对截取起点），
+        # --thumb-image 直接拿现成图片，跳过抽帧。越界会夹住，免得抽不到帧直接失败。
+        t_at = max(0.0, a.thumb_at or 0.0)
+        if a.duration:
+            t_at = min(t_at, max(0.0, a.duration - 0.05))
+        end_ref = min([x for x in (dur, vid_dur) if x] or [0]) or None
+        if end_ref:
+            t_at = min(t_at, max(0.0, end_ref - a.start - 0.05))
+        t_ss = a.start + t_at
+        src_img = None
+        if a.thumb_image:
+            with Image.open(a.thumb_image) as im:
+                src_img = im.convert("RGB")
+            print(f"  缩略图用指定图片: {a.thumb_image}")
+        elif t_ss:
+            print(f"  缩略图取 {t_ss:g}s 处的画面（默认取首帧）")
         for name, (tw, th) in (("NCTH", (160, 120)),
                                ("NCM1", (640, 360)),
                                ("NCVW", (sw, sh))):
-            png = PROBE / f"th-{tag}-{name}.png"
-            run([FFMPEG, "-y", "-v", "error", "-i", str(src)] + trim +
-                ["-map", "0:v:0",
-                 "-vf", vf + f",scale={tw}:{th}",
-                 "-frames:v", "1", "-f", "image2", str(png)], f"缩略图帧 {name}")
-            with Image.open(png) as im:
-                thumbs[name] = camjpeg.pillow_camera_jpeg(im, tpl_jpegs[name])
+            if src_img is not None:
+                thumbs[name] = camjpeg.pillow_camera_jpeg(
+                    src_img.resize((tw, th), Image.LANCZOS), tpl_jpegs[name])
+            else:
+                png = PROBE / f"th-{tag}-{name}.png"
+                run([FFMPEG, "-y", "-v", "error", "-i", str(src)]
+                    + (["-ss", f"{t_ss:g}"] if t_ss else [])
+                    + ["-map", "0:v:0",
+                       "-vf", vf + f",scale={tw}:{th}",
+                       "-frames:v", "1", "-f", "image2", str(png)],
+                    f"缩略图帧 {name}")
+                with Image.open(png) as im:
+                    thumbs[name] = camjpeg.pillow_camera_jpeg(im, tpl_jpegs[name])
             marks, sof, ndq = camjpeg.jpeg_info(thumbs[name])
             print(f"  {name} {tw}x{th}: {len(thumbs[name]):,} B JPEG  "
                   f"采样={sof[2][0][1]} 标记={marks[:5]}")
@@ -459,6 +582,11 @@ def main():
         for f in list(PROBE.glob(f"th-{tag}-*.png")) + [es, pcm]:
             f.unlink(missing_ok=True)
         print("  中间文件已清理")
+
+    st.mark("收尾")
+    _emit("done", out=str(Path(a.out).resolve()),
+          size=Path(a.out).stat().st_size,
+          seconds=round(time.time() - st.t, 1))
 
 
 if __name__ == "__main__":

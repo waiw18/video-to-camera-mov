@@ -1,0 +1,603 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>相机视频转换器 · 前端设计稿 v1</title>
+<style>
+  :root{
+    --bg:#eceef1; --win:#ffffff;
+    --ink:#1c2024; --ink2:#5b6570; --ink3:#8b959f;
+    --line:#e3e7eb; --line2:#eef1f4;
+    --accent:#2563c9; --accent-h:#1d4fa8; --accent-soft:#eaf1fd;
+    --ok:#1a7f4b; --ok-soft:#e8f5ee;
+    --warn:#9a6700; --warn-soft:#fdf6e3;
+    --danger:#b42318;
+    --log-bg:#1b1f24; --log-ink:#d7dee6;
+    --ui:"Segoe UI",system-ui,-apple-system,"Microsoft YaHei UI","微软雅黑",sans-serif;
+    --mono:Consolas,"Cascadia Mono","Courier New",monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:var(--bg); color:var(--ink); font-family:var(--ui); font-size:13px;
+    -webkit-font-smoothing:antialiased;
+  }
+  /* ---------- 画布：把设计稿摆成“一个窗口”的样子 ---------- */
+  .stage{min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:22px 20px 40px;gap:14px}
+  .draftbar{width:1020px;display:flex;align-items:center;gap:10px;color:var(--ink2);font-size:12px}
+  .draftbar b{color:var(--ink);font-weight:600}
+  .draftbar .sp{flex:1}
+  .win{
+    width:1020px;background:var(--win);border:1px solid #d9dee4;border-radius:10px;
+    box-shadow:0 14px 44px rgba(16,24,40,.16);overflow:hidden;
+  }
+  .titlebar{
+    height:38px;display:flex;align-items:center;gap:8px;padding:0 6px 0 12px;
+    background:#f7f9fa;border-bottom:1px solid var(--line);
+  }
+  .titlebar .logo{width:16px;height:16px;border-radius:4px;background:var(--accent);opacity:.85}
+  .titlebar .tname{font-size:12.5px;font-weight:600}
+  .titlebar .tsub{font-size:11.5px;color:var(--ink3)}
+  .titlebar .sp{flex:1}
+  .winbtn{width:40px;height:28px;display:grid;place-items:center;color:var(--ink2);border-radius:5px;cursor:default;font-size:12px}
+  .winbtn.x:hover{background:#ffe9e9;color:var(--danger)}
+  .winbtn:hover{background:#eceff2}
+
+  .body{padding:14px 16px 12px;display:flex;flex-direction:column;gap:11px}
+
+  /* ---------- 顶栏：模式切换 + 预览状态 ---------- */
+  .topbar{display:flex;align-items:center;gap:12px}
+  .seg{display:inline-flex;background:#eef1f4;border-radius:8px;padding:3px;gap:2px}
+  .seg button{
+    border:0;background:transparent;font:inherit;font-size:12.5px;color:var(--ink2);
+    padding:6px 16px;border-radius:6px;cursor:pointer;
+  }
+  .seg button.active{background:#fff;color:var(--ink);font-weight:600;box-shadow:0 1px 2px rgba(16,24,40,.12)}
+  .topbar .sp{flex:1}
+  .mock{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--ink3)}
+  .mock .mk{border:1px dashed #cbd3db;background:#fff;color:var(--ink2);font:inherit;font-size:11.5px;
+    padding:4px 9px;border-radius:6px;cursor:pointer}
+  .mock .mk.on{border-style:solid;border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+
+  /* ---------- 卡片 ---------- */
+  .card{border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#fff}
+  .hd{
+    display:flex;align-items:center;gap:8px;padding:8px 12px;background:#fbfcfd;
+    border-bottom:1px solid var(--line2);font-size:12.5px;font-weight:600;
+  }
+  .hd .num{color:var(--accent);font-weight:700}
+  .hd .sp{flex:1}
+  .hd .hint{font-weight:400;font-size:11.5px;color:var(--ink3)}
+  .bd{padding:12px}
+
+  /* ---------- 表单 ---------- */
+  .row{display:grid;grid-template-columns:78px 1fr auto;gap:10px;align-items:center}
+  .row + .row{margin-top:9px}
+  .row > label{color:var(--ink2);text-align:right;font-size:12.5px}
+  input[type=text],select{
+    font:inherit;font-size:12.5px;color:var(--ink);height:32px;width:100%;
+    padding:0 9px;border:1px solid var(--line);border-radius:6px;background:#fff;
+  }
+  select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,#8b959f 50%),linear-gradient(135deg,#8b959f 50%,transparent 50%);
+    background-position:calc(100% - 14px) 14px,calc(100% - 9px) 14px;background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:26px}
+  input[type=text]:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  input:disabled,select:disabled{background:#f5f7f9;color:var(--ink3);cursor:not-allowed;border-color:var(--line2)}
+  .btn{
+    font:inherit;font-size:12.5px;height:32px;padding:0 13px;border:1px solid #d5dbe2;background:#fff;
+    color:var(--ink);border-radius:6px;cursor:pointer;white-space:nowrap;
+  }
+  .btn:hover{background:#f6f8fa}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+  .btn.primary:hover{background:var(--accent-h);border-color:var(--accent-h)}
+  .btn.ghost{border-color:transparent;color:var(--ink2)}
+  .btn.ghost:hover{background:#f0f3f6}
+  .btn[disabled]{opacity:.5;cursor:not-allowed}
+  .btn.sm{height:26px;padding:0 10px;font-size:12px}
+  .note{font-size:11.5px;color:var(--ink3);margin-top:7px;line-height:1.5}
+  .note.ok{color:var(--ok)}
+  .note.warn{color:var(--warn)}
+  .chip{display:inline-block;font-size:11px;padding:1px 6px;border-radius:4px;background:#eef1f4;color:var(--ink2);margin-left:6px}
+  .chip.lock{background:var(--warn-soft);color:var(--warn);border:1px solid #f0e2b8}
+  .chip.ok{background:var(--ok-soft);color:var(--ok);border:1px solid #cfe9da}
+
+  /* ---------- 高级模式网格 ---------- */
+  .grp{padding:0 0 2px;margin:0 0 8px;font-size:11.5px;color:var(--ink3);letter-spacing:.02em;border-bottom:1px solid var(--line2);padding-bottom:5px}
+  .grp:not(:first-child){margin-top:14px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:9px 22px}
+  .f{display:grid;grid-template-columns:118px 1fr;gap:9px;align-items:center}
+  .f > label{color:var(--ink2);text-align:right;font-size:12.5px;white-space:nowrap}
+  .f .unit{position:relative}
+  .f .unit input{padding-right:34px}
+  .f .unit span{position:absolute;right:10px;top:50%;transform:translateY(-50%);font-size:11.5px;color:var(--ink3);pointer-events:none}
+  .full{grid-column:1 / -1}
+  .chk{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink);height:32px}
+  .chk input{width:15px;height:15px;accent-color:var(--accent)}
+  .locked{background:var(--warn-soft);border:1px solid #f0e2b8;border-radius:6px;padding:2px 9px;height:32px;
+    display:flex;align-items:center;gap:7px;font-size:12.5px;color:#7a5200}
+
+  /* ---------- 缩略图 ---------- */
+  .thumbblock{border-top:1px solid var(--line2)}
+  .thumbrow{display:flex;align-items:flex-start;gap:14px}
+  .prevbox{width:192px;height:108px;border:1px solid var(--line);border-radius:6px;
+    background:linear-gradient(135deg,#e9edf1 0%,#dbe2e9 55%,#cfd8e1 100%);
+    display:grid;place-items:center;color:#8b959f;font-size:11.5px}
+  .prevbox.mini{width:64px;height:48px;font-size:10px}
+  .cap{font-size:11px;color:var(--ink3);margin-top:4px;text-align:center;max-width:200px}
+  .thumbctl{flex:1;display:flex;flex-direction:column;gap:8px}
+  .seg-mini{display:inline-flex;background:#eef1f4;border-radius:6px;padding:2px;gap:2px}
+  .seg-mini button{border:0;background:transparent;font:inherit;font-size:12px;color:var(--ink2);
+    padding:4px 11px;border-radius:4px;cursor:pointer}
+  .seg-mini button.on{background:#fff;color:var(--ink);font-weight:600;box-shadow:0 1px 2px rgba(16,24,40,.12)}
+  .tl{display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--ink2)}
+  .rng{flex:0 1 280px;accent-color:var(--accent)}
+  .tval{font-variant-numeric:tabular-nums;font-weight:600;color:var(--ink);min-width:54px}
+  .advshow{display:none}
+  body[data-mode="adv"] .advshow{display:inline}
+
+  /* ---------- 按钮组 ---------- */
+  .actions{display:flex;align-items:center;gap:9px;padding:11px 12px}
+  .actions .sp{flex:1}
+  .steps{display:flex;align-items:center;gap:9px}
+  .stepno{width:18px;height:18px;border-radius:50%;background:#eef1f4;color:var(--ink2);display:grid;place-items:center;font-size:11px;font-weight:700}
+  .btn.step{display:inline-flex;align-items:center;gap:8px;padding:0 14px}
+
+  /* ---------- 进度 ---------- */
+  .prog{display:flex;flex-direction:column;gap:9px}
+  .progtop{display:flex;align-items:center;gap:10px}
+  .badge{font-size:11.5px;padding:3px 8px;border-radius:5px;background:#eef1f4;color:var(--ink2);font-weight:600}
+  .badge.run{background:var(--accent-soft);color:var(--accent)}
+  .badge.ok{background:var(--ok-soft);color:var(--ok)}
+  .badge.err{background:#fdeceb;color:var(--danger)}
+  .progtop .stage-txt{font-size:12.5px;color:var(--ink2)}
+  .progtop .sp{flex:1}
+  .pct{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums}
+  .track{height:8px;border-radius:5px;background:#eef1f4;overflow:hidden}
+  .fill{height:100%;width:0;background:var(--accent);border-radius:5px}
+  body[data-state="run"] .fill{width:42%}
+  body[data-state="done"] .fill{width:100%;background:var(--ok)}
+  .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;border-top:1px solid var(--line2);padding-top:9px}
+  body[data-state="idle"] .stats{display:none}
+  .stat .k{font-size:11.5px;color:var(--ink3);margin-bottom:3px}
+  .stat .v{font-size:12.5px;font-weight:600;font-variant-numeric:tabular-nums}
+  .stat .v.dim{color:var(--ink3);font-weight:400}
+  body[data-state="done"] .stat .v.dim{color:var(--ink)}
+
+  /* ---------- 日志 ---------- */
+  .loghd .tools{display:flex;align-items:center;gap:4px}
+  .logbox{height:186px;overflow:auto;background:var(--log-bg);padding:9px 12px;font-family:var(--mono);font-size:12px;line-height:1.6;color:var(--log-ink)}
+  .logbox div{white-space:pre-wrap;word-break:break-all}
+  .lt{color:#7d8894}
+  .ls{color:#58c98a}
+  .lw{color:#e5c07b}
+  .le{color:#e06c75}
+  .ld{color:#98a2ae}
+  .logset{display:none}
+  body[data-state="idle"] .logset.idle{display:block}
+  body[data-state="run"] .logset.run{display:block}
+  body[data-state="done"] .logset.done{display:block}
+
+  /* ---------- 状态栏 ---------- */
+  .statusbar{display:flex;align-items:center;gap:10px;padding:7px 12px;border-top:1px solid var(--line);
+    background:#fbfcfd;font-size:11.5px;color:var(--ink3)}
+  .statusbar .sp{flex:1}
+  .dot{width:6px;height:6px;border-radius:50%;background:#c3ccd5;display:inline-block;margin-right:5px}
+  body[data-state="run"] .dot{background:var(--accent)}
+  body[data-state="done"] .dot{background:var(--ok)}
+
+  /* ---------- 模式切换：显示哪一组参数 ---------- */
+  .adv{display:none}
+  body[data-mode="adv"] .adv{display:block}
+  body[data-mode="adv"] .basic{display:none}
+  body[data-mode="adv"] .advhint{display:none}
+</style>
+</head>
+<body data-mode="basic" data-state="idle">
+<div class="stage">
+
+  <div class="draftbar">
+    <b>前端设计稿 v1</b>
+    <span>·</span>
+    <span>可点：普通 / 高级模式切换、右上角“预览状态”换个样子看</span>
+    <span class="sp"></span>
+    <span>静态样式稿，不接后端</span>
+  </div>
+
+  <div class="win">
+    <!-- 标题栏 -->
+    <div class="titlebar">
+      <div class="logo"></div>
+      <span class="tname">相机视频转换器</span>
+      <span class="tsub">Nikon Z5II · 1080p59.94 / H.265</span>
+      <span class="sp"></span>
+      <div class="winbtn">—</div>
+      <div class="winbtn">▢</div>
+      <div class="winbtn x">✕</div>
+    </div>
+
+    <div class="body">
+
+      <!-- 顶栏 -->
+      <div class="topbar">
+        <div class="seg" id="seg">
+          <button data-mode="basic" class="active">普通模式</button>
+          <button data-mode="adv">高级模式</button>
+        </div>
+        <span class="sp"></span>
+        <span class="mock">
+          预览状态（仅设计稿）：
+          <button class="mk on" data-state="idle">空闲</button>
+          <button class="mk" data-state="run">转换中</button>
+          <button class="mk" data-state="done">完成</button>
+        </span>
+      </div>
+
+      <!-- ① 文件 -->
+      <section class="card">
+        <div class="hd"><span class="num">①</span>输入与输出<span class="sp"></span>
+          <span class="hint">支持 mp4 / mov / mkv / avi / ts / flv / webm</span></div>
+        <div class="bd">
+          <div class="row">
+            <label>输入文件</label>
+            <input type="text" id="src" placeholder="选择要转换的视频…" value="D:\视频\旅行片段.mp4">
+            <button class="btn" data-act="pick-src">浏览…</button>
+          </div>
+          <div class="row">
+            <label>输出目录</label>
+            <input type="text" id="outdir" placeholder="转换结果放在哪里…" value="D:\相机转换输出">
+            <button class="btn" data-act="pick-dir">浏览…</button>
+          </div>
+          <div class="row">
+            <label>输出文件名</label>
+            <input type="text" id="outname" value="DSC_4600.MOV" style="max-width:180px;justify-self:start">
+            <span class="hint" style="color:var(--ink3);font-size:11.5px;justify-self:start">
+              相机按 DSC_#### 编号，别和卡上已有的重名
+            </span>
+          </div>
+          <div class="note" id="srcInfo">源 1920×1080 · 30fps · 4:01 · 含音频　→　输出 1920×1080 · 59.94fps · H.265 / PCM 24bit　·　预计转换约 20 分钟</div>
+        </div>
+      </section>
+
+      <!-- ② 参数 -->
+      <section class="card">
+        <div class="hd"><span class="num">②</span>转换参数<span class="sp"></span>
+          <span class="hint advhint">普通模式只用真机验证过的配方，改不了也没必要改</span>
+          <span class="hint adv" style="display:none">每项可自定义；标“已锁定”的项会破坏相机兼容性，工具不开放</span>
+        </div>
+
+        <!-- 普通模式 -->
+        <div class="bd basic">
+          <div class="grid2">
+            <div class="f"><label>转换预设</label>
+              <select>
+                <option selected>推荐 · 15 Mbps / fast（真机验证）</option>
+                <option>高画质 · 40 Mbps / medium（更慢、更大）</option>
+                <option>小体积 · 8 Mbps / fast（画质有损）</option>
+              </select>
+            </div>
+            <div class="f"><label>相机模板</label>
+              <div class="locked" style="background:#f5f7f9;border-color:var(--line2);color:var(--ink2)">
+                包内自带 templates\DSC_8955.MOV<span class="sp" style="flex:1"></span>
+                <button class="btn sm ghost" data-act="pick-tpl">换一个…</button>
+              </div>
+            </div>
+          </div>
+          <div class="note ok">✓ 输出固定为 1920×1080 / 59.94fps / H.265(x265) / PCM 24bit，与 Nikon Z5II 原生格式一致。</div>
+          <div class="note warn">⚠ 源视频是 30fps 时会被补帧到 59.94，转换时间约翻倍 —— 这是相机能播的前提，不要改。</div>
+        </div>
+
+        <!-- 高级模式 -->
+        <div class="bd adv">
+          <div class="grp">画面</div>
+          <div class="grid2">
+            <div class="f"><label>分辨率 --size</label>
+              <select><option selected>1920x1080</option><option>3840x2160（未验证）</option></select></div>
+            <div class="f"><label>输出帧率 --fps</label>
+              <select><option selected>60000/1001 · 59.94（相机原生）</option><option>source · 跟随源（相机可能不认）</option></select></div>
+            <div class="f full"><label>码率 --bitrate</label>
+              <div style="display:flex;align-items:center;gap:8px">
+                <input type="text" value="15M" style="max-width:130px">
+                <span class="hint" style="color:var(--ink3);font-size:11.5px">CBR 近似；15M 与相机原生码率同档，40M 画质更好、体积翻倍</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="grp">编码</div>
+          <div class="grid2">
+            <div class="f"><label>x265 预设 --preset</label>
+              <select><option selected>fast</option><option>faster</option><option>veryfast</option><option>medium（慢 2-3 倍）</option></select></div>
+            <div class="f"><label>编码器 --encoder</label>
+              <div class="locked">x265（已锁定）<span class="sp" style="flex:1"></span>
+                <span style="font-size:11px;color:#9a6700">GPU 会产出相机不认的文件</span></div>
+            </div>
+            <div class="f"><label>并行段数 --jobs</label>
+              <div class="locked">1 · 单进程（已锁定）<span class="sp" style="flex:1"></span>
+                <span style="font-size:11px;color:#9a6700">&gt;1 实测播到中途跳出</span></div>
+            </div>
+            <div class="f"><label>mdat 块 --mdat</label>
+              <div class="locked">655360（沿用模板）<span class="sp" style="flex:1"></span>
+                <span style="font-size:11px;color:#9a6700">相机按 0.5 秒分块</span></div>
+            </div>
+          </div>
+
+          <div class="grp">截取</div>
+          <div class="grid2">
+            <div class="f"><label>起始 --start</label>
+              <div class="unit"><input type="text" value="0"><span>秒</span></div></div>
+            <div class="f"><label>时长 --duration</label>
+              <div class="unit"><input type="text" placeholder="留空 = 整段（推荐）"><span>秒</span></div></div>
+          </div>
+          <div class="note warn">⚠ 截取出来的短文件（≤1 分钟）在相机上快进越界时不会被夹紧；全长文件正常。发布测试版不推荐截取。</div>
+
+          <div class="grp">音频与元数据</div>
+          <div class="grid2">
+            <div class="f"><label>音频</label>
+              <label class="chk"><input type="checkbox">不带音频 --no-audio</label></div>
+            <div class="f"><label>拍摄时间 --time</label>
+              <select><option selected>now · 用当前时间</option><option>keep · 沿用模板时间</option><option>指定时间…</option></select></div>
+            <div class="f"><label>中间文件</label>
+              <label class="chk"><input type="checkbox">保留中间文件 --keep</label></div>
+            <div class="f full"><label>模板 MOV --template</label>
+              <div style="display:flex;gap:8px">
+                <input type="text" value="templates\DSC_8955.MOV">
+                <button class="btn" data-act="pick-tpl">浏览…</button>
+                <button class="btn ghost" data-act="reset-tpl">恢复默认</button>
+              </div>
+            </div>
+          </div>
+          <div class="note">ℹ 必须用相机自己录的同规格 MOV 当模板：容器结构、时间基、缩略图都照抄它。tkhd 时长为可播放长度、由工具按模板写入，不提供修改项。</div>
+        </div>
+
+        <!-- 缩略图（普通 / 高级模式共有） -->
+        <div class="bd thumbblock">
+          <div class="grp">缩略图<span class="hint" style="margin-left:8px">相机播放列表和全屏预览里显示的画面</span></div>
+          <div class="thumbrow">
+            <div>
+              <div class="prevbox"><span>取帧预览</span></div>
+              <div class="cap" id="prevCap">1920×1080（NCVW）· 三张同一帧</div>
+            </div>
+            <div>
+              <div class="prevbox mini"><span>160×120</span></div>
+              <div class="cap" style="max-width:64px">列表图<br>NCTH</div>
+            </div>
+            <div class="thumbctl">
+              <div class="tl">
+                <span class="seg-mini" id="thumbSeg">
+                  <button class="on" data-thumb="first">首帧（默认）</button>
+                  <button data-thumb="time">指定时间</button>
+                  <button data-thumb="file">图片文件</button>
+                </span>
+                <span class="advshow" style="color:var(--ink3);font-size:11.5px">--thumb-at 秒 / --thumb-image 文件</span>
+              </div>
+              <div class="tl" id="thumbFirst">取视频第一帧（有截取时取截取起点）—— 和相机原生行为一致，最稳</div>
+              <div class="tl" id="thumbTime" style="display:none">
+                <input type="range" class="rng" id="thumbRange" min="0" max="241" step="0.5" value="0">
+                <span class="tval" id="thumbVal">00:00.0</span>
+                <button class="btn sm" data-act="grab">取这一帧</button>
+              </div>
+              <div class="tl" id="thumbFile" style="display:none">
+                <input type="text" id="thumbPath" value="D:\图片\封面.jpg" style="max-width:260px">
+                <button class="btn sm" data-act="pick-thumb">浏览…</button>
+              </div>
+              <div class="tl">
+                <label class="chk"><input type="checkbox">不重建缩略图<span class="advshow"> --no-thumbs</span>（沿用模板那 3 张）</label>
+              </div>
+            </div>
+          </div>
+          <div class="note">ℹ 三张一起换：160×120（NCTH）、640×360（NCM1）、1920×1080（NCVW）。都会重编成相机规格 JPEG（4:2:2 + 相机量化表 + 标记顺序），否则相机会拒绝整个文件 —— 这一步工具做，你只管挑画面。</div>
+        </div>
+      </section>
+
+      <!-- ③ 操作 -->
+      <div class="card actions">
+        <div class="steps">
+          <button class="btn primary step" id="btnGo"><span class="stepno">1</span>开始转换</button>
+          <button class="btn step" id="btnCancel" style="display:none">取消转换</button>
+          <button class="btn step" id="btnVerify" disabled><span class="stepno">2</span>校验门禁</button>
+          <button class="btn step" id="btnCopy" disabled><span class="stepno">3</span>拷到卡上</button>
+        </div>
+        <span class="sp"></span>
+        <button class="btn ghost sm">打开输出目录</button>
+      </div>
+
+      <!-- ④ 进度 -->
+      <section class="card">
+        <div class="hd">进度与预计时间<span class="sp"></span>
+          <span class="hint">剩余时间按最近 30 秒平均速度估算</span></div>
+        <div class="bd prog">
+          <div class="progtop">
+            <span class="badge" id="badge">空闲</span>
+            <span class="stage-txt" id="stageTxt">等待开始</span>
+            <span class="sp"></span>
+            <span class="pct" id="pct">—</span>
+          </div>
+          <div class="track"><div class="fill"></div></div>
+          <div class="stats">
+            <div class="stat"><div class="k">已用时间</div><div class="v dim" id="s1">—</div></div>
+            <div class="stat"><div class="k">预计剩余</div><div class="v dim" id="s2">—</div></div>
+            <div class="stat"><div class="k">编码速度</div><div class="v dim" id="s3">—</div></div>
+            <div class="stat"><div class="k">已处理 / 总时长</div><div class="v dim" id="s4">—</div></div>
+            <div class="stat"><div class="k">输出大小</div><div class="v dim" id="s5">—</div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ⑤ 日志 -->
+      <section class="card">
+        <div class="hd loghd">日志<span class="sp"></span>
+          <div class="tools">
+            <button class="btn sm ghost">清空</button>
+            <button class="btn sm ghost" data-act="copy">复制</button>
+            <button class="btn sm ghost">保存…</button>
+          </div>
+        </div>
+        <div class="logbox" id="logbox">
+          <div class="logset idle">
+<span class="ld">[就绪] 选好输入文件与输出目录，点“开始转换”。</span>
+<span class="ld">[提示] 4 分钟视频约需 20 分钟（i5-12450H），编码占 97%，进度条不会走得很快。</span>
+<span class="ld">[提示] 转换完成后会自动跑 43 项门禁；43/43 通过才建议拷到卡上。</span>
+          </div>
+          <div class="logset run">
+<span class="lt">[18:42:03]</span> 输入: 旅行片段.mp4  容器时长=241.6s  视频轨=241.6s  含音频=True
+<span class="lt">[18:42:03]</span>   帧率归一到相机时基: 30000/1001 -&gt; 60000/1001
+<span class="lt">[18:42:04]</span>   编码高度 1088（显示 1080），conformance_window 裁 0,0,0,4
+<span class="lt">[18:42:31]</span>   <span class="ls">已编码 HEVC（x265）: 41,208,336 B</span>
+<span class="lt">[18:42:31]</span>   [用时] 编码 HEVC: 27.4s（累计 28.1s）
+<span class="lt">[18:42:33]</span>   已准备 PCM: 34,882,650 B（5,813,775 帧）
+<span class="lt">[18:42:36]</span>   NCTH 160x120: 5,102 B JPEG  采样=2:1/1:1/1:1 标记=[SOI, DQT, SOF0, DHT, SOS]
+<span class="lt">[18:42:36]</span>   NCM1 640x360: 27,431 B JPEG  采样=2:1/1:1/1:1 标记=[SOI, DQT, SOF0, DHT, SOS]
+<span class="lt">[18:42:36]</span>   NCVW 1920x1080: 231,806 B JPEG  采样=2:1/1:1/1:1 标记=[SOI, DQT, SOF0, DHT, SOS]
+<span class="lt">[18:42:36]</span>   拍摄时间设为现在: 2026:02:14 18:42:36
+<span class="lt">[18:43:02]</span>   <span class="ls">已写出 D:\相机转换输出\DSC_4600.MOV（121,406,720 B）</span>
+<span class="lt">[18:43:02]</span> [成功]
+<span class="lw">[18:43:03] ========== ② 校验门禁：DSC_4600.MOV ==========</span>
+          </div>
+          <div class="logset done">
+<span class="lt">[19:02:41]</span> ========== ② 校验门禁：DSC_4600.MOV ==========
+<span class="lt">[19:02:44]</span>   容器布局 12/12 · 时长自洽 6/6 · 分块 4/4 · NCDT 5/5
+<span class="lt">[19:02:45]</span>   缩略图 3/3（含解码验证）· 参数集 7/7（trace 到 P 帧）· 整体解码 6/6
+<span class="ls">[19:02:45]</span>   <span class="ls">43/43 项通过</span>
+<span class="lt">[19:02:45]</span> [成功]
+<span class="lt">[19:03:10]</span> ========== ③ 拷到卡上：DSC_4600.MOV ==========
+<span class="lt">[19:04:02]</span>   已写入 F:\DCIM\100NZ5_2\DSC_4600.MOV（121.4 MB）
+<span class="ls">[19:04:02]</span>   <span class="ls">完成 —— 拔卡插到相机上，按播放键确认一次</span>
+          </div>
+        </div>
+      </section>
+
+    </div>
+
+    <!-- 状态栏 -->
+    <div class="statusbar">
+      <span><i class="dot"></i><span id="stTxt">空闲</span></span>
+      <span class="sp"></span>
+      <span id="stGate">门禁未运行</span>
+      <span>·</span>
+      <span>模板 DSC_8955.MOV</span>
+      <span>·</span>
+      <span>v0.1.0-beta.1</span>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var body = document.body;
+
+  // 模式切换
+  document.getElementById('seg').addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-mode]');
+    if (!b) return;
+    body.dataset.mode = b.dataset.mode;
+    this.querySelectorAll('button').forEach(function (x) {
+      x.classList.toggle('active', x === b);
+    });
+    document.querySelectorAll('.hd .adv').forEach(function (x) {
+      x.style.display = b.dataset.mode === 'adv' ? '' : 'none';
+    });
+  });
+
+  // 预览状态（仅设计稿用）
+  var S = {
+    idle: {badge:'空闲', cls:'', stage:'等待开始', pct:'—',
+      s1:'—', s2:'—', s3:'—', s4:'—', s5:'—', st:'空闲', gate:'门禁未运行'},
+    run: {badge:'转换中', cls:'run', stage:'编码 HEVC（x265）· 第 3/6 步', pct:'42.3%',
+      s1:'08:12', s2:'11:30', s3:'8.4 fps（0.14×）', s4:'1:41 / 4:01', s5:'51.2 MB',
+      st:'转换中', gate:'门禁未运行'},
+    done: {badge:'已完成', cls:'ok', stage:'校验通过 · 可以拷到卡上', pct:'100%',
+      s1:'21:38', s2:'00:00', s3:'—', s4:'4:01 / 4:01', s5:'380.1 MB',
+      st:'完成', gate:'门禁 43/43 通过'}
+  };
+  function setState(s) {
+    var d = S[s]; if (!d) return;
+    body.dataset.state = s;
+    var b = document.getElementById('badge');
+    b.textContent = d.badge; b.className = 'badge ' + d.cls;
+    document.getElementById('stageTxt').textContent = d.stage;
+    document.getElementById('pct').textContent = d.pct;
+    ['s1', 's2', 's3', 's4', 's5'].forEach(function (k, i) {
+      document.getElementById(k).textContent = d['s' + (i + 1)];
+    });
+    document.getElementById('stTxt').textContent = d.st;
+    document.getElementById('stGate').textContent = d.gate;
+    document.querySelectorAll('.mock .mk').forEach(function (x) {
+      x.classList.toggle('on', x.dataset.state === s);
+    });
+    document.getElementById('logbox').scrollTop = 0;
+    // 按钮可用状态：转换中只有“取消”；转换完成后 ②③ 才可用
+    document.getElementById('btnGo').disabled = (s === 'run');
+    document.getElementById('btnCancel').style.display = (s === 'run') ? '' : 'none';
+    document.getElementById('btnVerify').disabled = (s !== 'done');
+    document.getElementById('btnCopy').disabled = (s !== 'done');
+  }
+  document.querySelector('.mock').addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-state]');
+    if (b) setState(b.dataset.state);
+  });
+
+  // 占位交互（设计稿里只填示例值）
+  var sample = {
+    'pick-src': ['src', 'D:\\视频\\海边日落.mp4'],
+    'pick-dir': ['outdir', 'F:\\DCIM\\100NZ5_2'],
+    'pick-thumb': ['thumbPath', 'D:\\图片\\日落封面.jpg'],
+    'pick-tpl': ['', '']
+  };
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-act]');
+    if (!b) return;
+    var act = b.dataset.act;
+    if (sample[act] && sample[act][0]) {
+      document.getElementById(sample[act][0]).value = sample[act][1];
+    }
+    if (act === 'grab') {
+      document.getElementById('prevCap').textContent = '已取第 ' + fmt(+rng.value) + ' 帧';
+    }
+    if (act === 'copy') {
+      var t = document.getElementById('logbox').innerText;
+      navigator.clipboard && navigator.clipboard.writeText(t);
+      b.textContent = '已复制';
+      setTimeout(function () { b.textContent = '复制'; }, 1200);
+    }
+  });
+
+  // 取消（设计稿里只做状态演示）
+  document.getElementById('btnCancel').onclick = function () { setState('idle'); };
+
+  // 缩略图：取帧方式切换 + 时间轴读数
+  function fmt(s) {
+    var m = Math.floor(s / 60), r = s - m * 60;
+    return (m < 10 ? '0' : '') + m + ':' + (r < 10 ? '0' : '') + r.toFixed(1);
+  }
+  var rng = document.getElementById('thumbRange');
+  var tseg = document.getElementById('thumbSeg');
+  tseg.addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-thumb]');
+    if (!b) return;
+    tseg.querySelectorAll('button').forEach(function (x) { x.classList.toggle('on', x === b); });
+    var m = b.dataset.thumb;
+    document.getElementById('thumbFirst').style.display = (m === 'first') ? '' : 'none';
+    document.getElementById('thumbTime').style.display = (m === 'time') ? '' : 'none';
+    document.getElementById('thumbFile').style.display = (m === 'file') ? '' : 'none';
+    if (m === 'first') { document.getElementById('prevCap').textContent = '1920×1080（NCVW）· 三张同一帧'; }
+  });
+  rng.addEventListener('input', function () {
+    document.getElementById('thumbVal').textContent = fmt(+rng.value);
+    document.getElementById('prevCap').textContent = '取第 ' + fmt(+rng.value) + ' 帧 · 1920×1080（NCVW）';
+  });
+  rng.dispatchEvent(new Event('input'));
+
+  // 允许用 #adv / #run 直接打开某个状态，方便截图评审
+  var h = (location.search + location.hash).toLowerCase();
+  if (h.indexOf('adv') >= 0) document.querySelector('.seg button[data-mode=adv]').click();
+  if (h.indexOf('run') >= 0) setState('run');
+  if (h.indexOf('done') >= 0) setState('done');
+  if (h.indexOf('thumbtime') >= 0) {
+    tseg.querySelector('button[data-thumb=time]').click();
+    rng.value = 96.5;
+    rng.dispatchEvent(new Event('input'));
+    document.querySelector('.thumbblock').scrollIntoView({ block: 'center' });
+  }
+})();
+</script>
+</body>
+</html>

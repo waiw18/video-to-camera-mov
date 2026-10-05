@@ -34,3 +34,6 @@ archive/
 .idea/
 Thumbs.db
 desktop.ini
+
+# 发布产物（zip / exe 同上，走 Release 附件）
+release/

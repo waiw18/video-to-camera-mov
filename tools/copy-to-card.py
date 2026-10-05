@@ -13,10 +13,12 @@
 """
 import argparse
 import hashlib
-import shutil
+import json
+import os
 import string
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -73,6 +75,39 @@ def sha256(p, chunk=1 << 20):
     return h.hexdigest().upper()
 
 
+def _emit(kind, **kw):
+    """给界面（app/main.py）用的机器可读进度行，协议见 tools/video-to-camera-mov.py。"""
+    print("##CAMMOV " + json.dumps({"k": kind, **kw}, ensure_ascii=False),
+          flush=True)
+
+
+def copy_prog(src, dst):
+    """分块拷贝并报进度。SD 卡写入慢（380 MB 要几十秒），界面必须有数。
+
+    语义与 shutil.copyfile 一致：逐字节写入；写完 fsync 落盘，再交给后面的
+    SHA256 回读校验（这是"卡上文件到底对不对"的唯一凭据，不能省）。
+    """
+    total = src.stat().st_size
+    done, t_last = 0, 0.0
+    _emit("stage", step=2, total=3, done="校验源哈希", running="写入卡")
+    with src.open("rb") as r, dst.open("wb") as w:
+        while True:
+            buf = r.read(1 << 20)
+            if not buf:
+                break
+            w.write(buf)
+            done += len(buf)
+            now = time.time()
+            if now - t_last >= 0.5:
+                t_last = now
+                _emit("prog", done=done, total=total,
+                      pct=round(done / total * 100, 1) if total else None)
+        w.flush()
+        os.fsync(w.fileno())
+    _emit("prog", done=done, total=total, pct=100.0)
+    return done
+
+
 def existing_numbers(mdir):
     import re
     nums = set()
@@ -125,6 +160,8 @@ def main():
             dst_old = mdir / name
             if dst_old.exists() and sha256(dst_old) == sha256(src):
                 print(f"卡上 {name} 与源文件哈希相同，无需重拷")
+                _emit("done", out=str(dst_old), bytes=dst_old.stat().st_size,
+                      skipped=True)
                 return
             print(f"卡上已有 {name}，--force：将覆盖")
 
@@ -132,8 +169,11 @@ def main():
     print(f"源:   {src}  ({src.stat().st_size:,} B)")
     print(f"目标: {dst}")
 
+    t0 = time.time()
+    _emit("stage", step=1, total=3, done=None, running="校验源哈希")
     h_src = sha256(src)
-    shutil.copyfile(src, dst)
+    copy_prog(src, dst)
+    _emit("stage", step=3, total=3, done="写入卡", running="回读校验")
     h_dst = sha256(dst)
     ok = h_src == h_dst and src.stat().st_size == dst.stat().st_size
 
@@ -145,6 +185,12 @@ def main():
                     f"Write-VolumeCache -DriveLetter {root.drive[0]}"],
                    capture_output=True, text=True, encoding="utf-8", errors="replace")
     print("  写缓存已刷新，可以拔卡")
+    if not ok:
+        # ★ 校验不一致必须非零退出：界面（和任何自动化）靠退出码判断能不能继续，
+        #   以前这里只是打印 FAIL 然后正常退出，会被当成成功。
+        raise SystemExit("  卡上文件与源不一致（SHA256 不同），请重新拷贝")
+    _emit("done", out=str(dst), bytes=dst.stat().st_size,
+          seconds=round(time.time() - t0, 1), verify=True)
     if not ok:
         sys.exit(1)
 

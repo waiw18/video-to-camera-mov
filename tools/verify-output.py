@@ -8,6 +8,7 @@
 import argparse
 import datetime
 import importlib.util
+import json
 import re
 import struct
 import subprocess
@@ -355,6 +356,11 @@ def main():
     print(f"\n=== 结论：{len(OK)} 项通过，{len(BAD)} 项未通过")
     for b in BAD:
         print(f"  未通过: {b}")
+    # 给界面（app/main.py）的机器可读结果：全部通过才允许下一步"拷到卡上"
+    print("##CAMMOV " + json.dumps(
+        {"k": "gate", "ok": len(OK), "bad": len(BAD),
+         "total": len(OK) + len(BAD), "failed": BAD}, ensure_ascii=False),
+        flush=True)
     return 1 if BAD else 0
 
 
