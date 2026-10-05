@@ -21,15 +21,19 @@
 
 Windows 10/11 x64，**不需要装 Python 或 ffmpeg**（ffmpeg/x265 已打进包里）：
 
-- [相机视频转换器-v0.1.0-beta.1-win64.zip](../../releases/download/v0.1.0-beta.1/相机视频转换器-v0.1.0-beta.1-win64.zip)
+- [video-to-camera-mov-v0.1.0-beta.1-win64.zip](../../releases/download/v0.1.0-beta.1/video-to-camera-mov-v0.1.0-beta.1-win64.zip)
   —— **推荐**：解压得到「相机视频转换器」文件夹（约 400 MB），启动快、好排错
-- [相机视频转换器-v0.1.0-beta.1-单文件.exe](../../releases/download/v0.1.0-beta.1/相机视频转换器-v0.1.0-beta.1-单文件.exe)
+- [video-to-camera-mov-v0.1.0-beta.1-onefile.exe](../../releases/download/v0.1.0-beta.1/video-to-camera-mov-v0.1.0-beta.1-onefile.exe)
   —— 只有一个文件，第一次启动要解压临时目录，慢一些
 
 发布页：<https://github.com/waiw18/video-to-camera-mov/releases/tag/v0.1.0-beta.1>
+测试指引：[docs/测试指引-v0.1.0-beta.1.md](docs/测试指引-v0.1.0-beta.1.md)（包内的 `测试指引.txt` 是同一份）
+
+> **8 Mbps 档不可用**：1280×720 源 + 8 Mbps 能转出来、43 项门禁也全过，
+> 但相机里提示"无法显示此文件"。码率请用 **15 Mbps 或以上**；界面里已经没有 8M 档了。
 
 图形界面里是三步：**① 开始转换 → ② 校验门禁（必须 43/43）→ ③ 拷到卡上**，
-转换中显示阶段、进度、编码速度和预计剩余时间。请按包内的 `测试指引.txt` 走一遍，
+转换中显示阶段、进度、编码速度和预计剩余时间。请按测试指引走一遍，
 回传结果的方式也写在里面。包内还有一个 `自检.cmd`：把一段短视频拖到它上面，
 就会自动跑一遍内置自检并把结果写成报告（不需要人盯着点界面）。
 
