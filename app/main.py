@@ -70,7 +70,7 @@ def default_outdir():
         base = home
     return base / "相机转换输出"
 
-APP_VERSION = "v0.1.0-beta.1"
+APP_VERSION = "v0.1.0-beta.2"
 MAXW = 1010                                  # 内容列最宽，再宽就居中留白
 CANCEL_FLAG = WORK / "cancel.flag"          # 取消转换用（工具 run_prog 会轮询）
 
@@ -195,6 +195,7 @@ class App:
         self.done_file = None
         self._photo = None
         self.src_probe = {}          # 最近一次 ffprobe 的源信息（判定帧率用）
+        self.used = {}               # 这次转换真正传给工具的参数（冒烟报告用）
 
         prep_env()
         self.tools = {}
@@ -1037,8 +1038,10 @@ class App:
                 self.lbl_pct.configure(text=f"{self.enc_pct:.1f}%")
             self.stat_lbls["预计剩余"].configure(text=fmt_secs(ev.get("eta")))
             if sp:
+                # 输出是多少 fps 就按多少换算，29.97 时别再拿 59.94 乘（会虚高一倍）
+                out_fps = 29.97 if self.fps_eff() == "source" else 59.94
                 self.stat_lbls["编码速度"].configure(
-                    text=f"{59.94 * sp:.1f} fps（{sp:.2f}×）")
+                    text=f"{out_fps * sp:.1f} fps（{sp:.2f}×）")
             if total:
                 self.stat_lbls["已处理 / 总时长"].configure(
                     text=f"{fmt_secs(done)} / {fmt_secs(total)}")
@@ -1128,9 +1131,10 @@ class App:
                 "覆盖？", f"{out}\n已经存在，要覆盖它吗？"):
             return
         out.parent.mkdir(parents=True, exist_ok=True)
+        br = self.var_bitrate.get().strip() or "15M"
+        xp = self.var_xpreset.get().strip() or "fast"
         argv = [src, "--out", str(out), "--template", tpl,
-                "--bitrate", self.var_bitrate.get().strip() or "15M",
-                "--preset", self.var_xpreset.get().strip() or "fast"]
+                "--bitrate", br, "--preset", xp]
         # 缩略图（默认首帧 = 什么都不传，也就是相机原生行为）
         mode = self.var_thumb_mode.get()
         if self.var_nothumbs.get():
@@ -1165,6 +1169,13 @@ class App:
         # 自动定段数（59.94→4 段、29.97→6 段，时长 <25 s 退单进程）。
         # 6 段并行的产物 DSC_8965（5M/29.97）与 DSC_9700 已真机播放通过。
         argv += ["--jobs", "0"]
+
+        # 记下「这次真正传出去的参数」，冒烟报告照抄这里。
+        # 报告读界面控件曾出现与真正编码不一致的取值（beta.2 前的 5M 假象），
+        # 报告只认实际 argv，才不会骗人。
+        self.used = {"bitrate": br, "preset": xp,
+                     "fps": "source" if self.fps_eff() == "source" else "59.94",
+                     "tpl": Path(tpl).name, "argv": " ".join(argv)}
 
         self.done_file = None
         self.gate_ok = False
@@ -1401,6 +1412,7 @@ def auto_smoke():
             copy_ok = "能加载"
         except Exception as e:
             copy_ok = f"加载失败：{e}"
+        u = getattr(app, "used", None) or {}
         lines = [
             f"结果       : {'成功' if success else '失败'}",
             f"用时       : {time.time() - t0:.0f}s",
@@ -1409,8 +1421,13 @@ def auto_smoke():
             f"输出存在   : {Path(out).exists()}"
             + (f"（{Path(out).stat().st_size:,} B）" if Path(out).exists() else ""),
             f"界面状态   : {app.state}   门禁通过: {app.gate_ok}",
-            f"输出帧率   : {app.fps_text()}   模板: {Path(app.var_tpl.get()).name}",
-            f"码率/预设  : {app.var_bitrate.get()} / {app.var_xpreset.get()}",
+            "输出帧率   : " + (("29.97（跟随源）" if u.get("fps") == "source"
+                                else "59.94") if u else app.fps_text())
+            + "   模板: " + (u.get("tpl") or Path(app.var_tpl.get()).name),
+            "码率/预设  : " + (f"{u.get('bitrate')} / {u.get('preset')}" if u
+                               else f"{app.var_bitrate.get()} / "
+                                    f"{app.var_xpreset.get()}（未跑转换）"),
+            f"实际参数   : {u.get('argv', '（未跑转换）')}",
             f"拷卡模块   : {copy_ok}",
             f"按钮       : ①{app.btn_go.cget('state')} ②{app.btn_ver.cget('state')}"
             f" ③{app.btn_copy.cget('state')}",

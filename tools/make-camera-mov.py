@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from boxio import walk, children, find, track_list, box, u32   # noqa: E402
+from boxio import walk, children, find, find_all, track_list, box, u32   # noqa: E402
 
 # hevc-ps.py 文件名带连字符，不能直接 import
 _ps_spec = importlib.util.spec_from_file_location(
@@ -42,6 +42,18 @@ _ps_spec.loader.exec_module(hevc_ps)
 from binpath import FFMPEG, FFPROBE
 CAM_FTYP = (struct.pack(">I", 24) + b"ftyp" + b"qt  "
             + struct.pack(">I", 538315008) + b"qt  " + b"niko")
+
+# ★ mdat 对齐粒度 = 128 KiB。相机自己的原片就是「moov 后面补一个 free 盒、
+#   把 mdat 顶到 128 KiB 边界」，实测 9 个原片全部落在 131,072 的整数倍上：
+#     DSC_9696 moov 结束 380,016 + free 13,200  -> mdat@393,216 (3×)
+#     DSC_8981 moov 结束 354,829 + free 38,387  -> mdat@393,216 (3×)
+#     DSC_9695 moov 结束 393,591 + free 130,697 -> mdat@524,288 (4×)
+#     DSC_8960/9697/9698 -> 524,288 (4×)；DSC_8955/8980 -> 655,360 (5×)；
+#     DSC_8607(4K) -> 1,966,080 (15×)
+#   即 offset = ceil((ftyp + moov + 8) / 131072) * 131072（DSC_9695/9696 两个
+#   样本用这个公式都能复现）。反过来也说明"mdat 沿用模板偏移"只是复刻布局的
+#   手段，不是相机的要求 —— 相机自己的文件偏移就是随 moov 大小浮动的。
+MDAT_ALIGN = 131072
 
 
 # ---------------------------------------------------------------- 码流
@@ -790,6 +802,33 @@ def build(es_path, out_path, template, mdat=None, drop_udta=False, audio_pcm=Non
 
     out = bytearray(CAM_FTYP)
     out += box(b"moov", body)
+    if target_mdat - len(out) < 8:
+        # ★ 长片的样本表 + NCDT 缩略图会把 moov 撑到模板偏移之外（4.1 万样本时
+        #   光样本表就 ~228 KB，再叠一张有细节的 1920×1080 NCVW 预览 ~660 KB，
+        #   938 KB > 模板的 524,288）。这不该判死：按上面 MDAT_ALIGN 记录的、
+        #   相机自己那套规则把 mdat 顶到下一个 128 KiB 边界，并把两个轨的 co64
+        #   条目（第 661 行已按旧偏移写好）整体平移同一个 delta。
+        old_mdat = target_mdat
+        target_mdat = max(old_mdat,
+                          (len(out) + 8 + MDAT_ALIGN - 1) // MDAT_ALIGN * MDAT_ALIGN)
+        delta = target_mdat - old_mdat
+        body_b = bytearray(body)
+        moved = 0
+        for off, typ, size, hdr in find_all(bytes(body_b), 0, len(body_b), b"co64"):
+            cnt = u32(body_b, off + 12)
+            for k in range(cnt):
+                q = off + 16 + 8 * k
+                struct.pack_into(">Q", body_b, q,
+                                 struct.unpack_from(">Q", body_b, q)[0] + delta)
+            moved += 1
+        if not moved:
+            raise SystemExit("抬高 mdat 时找不到 co64 表，拒绝写出可能损坏的文件")
+        body = bytes(body_b)
+        out = bytearray(CAM_FTYP)
+        out += box(b"moov", body)
+        print(f"  ⚠ moov {len(out):,} B 装不进模板 mdat@{old_mdat:,}："
+              f"mdat 抬到 {target_mdat:,}（+{delta:,}，按相机的 128 KiB 对齐规则），"
+              f"已平移 {moved} 个 co64 表")
     pad = target_mdat - len(out)
     if pad < 8:
         raise SystemExit(f"moov 到 {len(out)}，超过 {target_mdat}")

@@ -84,8 +84,11 @@ $TOOL_FILES = @(
     'hevc-ps.py'                #   H.265 参数集
 )
 # 模板必须是**你自己相机录的同规格 MOV**（仓库里没有：媒体文件不进版本库），
-# 放在 templates\DSC_8955.MOV；换机型就换成对应规格的模板。
-foreach ($p in @("$FF\ffmpeg.exe", "$FF\ffprobe.exe", 'templates\DSC_8955.MOV', 'app\main.py')) {
+# 放在 templates\ 下。界面会跟着输出帧率自动挑：
+#   DSC_8955.MOV = 1080p59.94 模板       DSC_8960.MOV = 1080p29.97 模板
+# 换机型就换成对应规格的模板。
+foreach ($p in @("$FF\ffmpeg.exe", "$FF\ffprobe.exe", 'templates\DSC_8955.MOV',
+                 'templates\DSC_8960.MOV', 'app\main.py')) {
     if (-not (Test-Path $p)) { throw "缺少: $p" }
     Write-Host "  OK  $p"
 }
@@ -131,9 +134,10 @@ Write-Host @"
 
 == 打包后必查 ==
   - dist\...\_internal\bin\ 下要有 ffmpeg.exe 与 ffprobe.exe
-  - dist\...\_internal\templates\DSC_8955.MOV 要在
+  - dist\...\_internal\templates\ 下要有两个模板：DSC_8955.MOV（59.94）与 DSC_8960.MOV（29.97）
   - dist\...\_internal\tools\ 里只该有那 8 个 .py（多出来就是又把实验脚本打进去了）
   - 在**没装 Python、没装 ffmpeg** 的机器上跑一次（这是测试版的意义）
+  - 两种帧率各冒烟一次：--fps-mode source 与默认（59.94），报告里模板名要跟着变
 "@
 
 exit 0

@@ -109,7 +109,15 @@ def main():
     check(bool(moov), "moov 存在")
     mdat = d.find(b"mdat", 4) - 4
     t_mdat = t.find(b"mdat", 4) - 4
-    check(mdat == t_mdat, "mdat 位置与模板一致", f"{mdat:,} vs {t_mdat:,}")
+    # ★ mdat 偏移：模板值是"复刻模板布局"的默认值，不是相机的要求 ——
+    #   相机自己的原片偏移就是随 moov 大小浮动的，全部落在 128 KiB 边界：
+    #     DSC_9696/8981 @393,216；DSC_8960/9695/9697/9698 @524,288；
+    #     DSC_8955/8980 @655,360；DSC_8607(4K) @1,966,080
+    #   长片样本表 + 缩略图放不下模板偏移时，工具会把 mdat 按同一条规则抬高
+    #   （见 make-camera-mov.py 的 MDAT_ALIGN）。两种都合规。
+    _mdat_ok = (mdat == t_mdat) or (mdat > t_mdat and mdat % 131072 == 0)
+    check(_mdat_ok, "mdat 位置：模板值或按 128 KiB 抬高",
+          f"{mdat:,} vs 模板 {t_mdat:,}")
 
     # ---- 2) 轨道结构 ----
     print("\n[2] 轨道结构")
