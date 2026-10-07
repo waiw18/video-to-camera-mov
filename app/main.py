@@ -7,11 +7,19 @@
 打包后**不需要额外的 Python**：工具模块被 PyInstaller 一起冻结，
 这里用 importlib 在进程内加载它们（工具本身只用 subprocess 调 ffmpeg）。
 
-界面按 design/前端设计稿-v1.html 的卡片式排版实现。三条硬约束（见
-交接-发布测试版.md）在界面上是**锁死并写明原因**的，不是"默认值"：
-    · 并行段数 --jobs 1（>1 实测相机播到中途跳出）
-    · 输出帧率 60000/1001（--fps source 走 29.97 那条路没打通）
+界面按 design/前端设计稿-v1.html 的卡片式排版实现。锁死的项（在界面上写明原因）：
+    · 编码器 x265（NVENC 会产出相机不认的文件）
+    · mdat 块 655360（0.5 秒分块，相机的要求）
     · 码流容器参数一律由工具按相机实测值写（tkhd.duration 保持模板原值）
+并行段数走工具的自动值（--jobs 0，GOP 对齐 v2）：时长 ≥25 s 才分段，
+59.94 → 4 段、29.97 → 6 段，每段线程按段数均分；6 段并行的产物（DSC_8965 /
+DSC_9700）2026-10-07 真机播放通过，所以 2026-10-02 那条"jobs>1 跳出"的
+老结论只对没做 GOP 对齐的 v1 成立。
+
+输出帧率是可选项（2026-10-07 起，29.97 通道已真机验证）：
+    · 59.94（相机原生，默认）：任何源都补/抽到 59.94，30fps 源会补帧、时间翻倍
+    · 跟随源：源是 30fps/29.97 时保持原速（快一倍、体积减半），其它源自动退回 59.94
+29.97 输出默认换成同规格的 30fps 模板（templates/DSC_8960.MOV，相机原片）。
 
 流程：转换 → 自动跑 43 项门禁 → 门禁全过才允许"拷到卡上"。
 进度靠工具 stdout 上的协议行（见 tools/video-to-camera-mov.py 的 _emit）：
@@ -98,12 +106,24 @@ F_BIG = ("Microsoft YaHei UI", 12, "bold")
 F_MONO = ("Consolas", 9)
 
 # 普通模式的预设（都是真机验证过的组合）
-# 8 Mbps 档实测相机不认（文件能转出来，但相机不播），所以本版不给选；
-# 高级模式的码率输入框里也写了同样的提醒。
+# 5 Mbps 档 2026-10-07 真机验证可播（DSC_8965：213.8 MB / 4.76 Mbit/s，43/43 门禁）；
+# 早期"8 Mbps 相机不认"的结论已作废（那次没有产物/日志留存，原因未查清），
+# 所以不再写"码率别低于 15 Mbps"这种一刀切的话。
 PRESETS = [
     ("推荐 · 15 Mbps / fast（真机验证）", "15M", "fast"),
+    ("小体积 · 5 Mbps / fast（真机验证可播）", "5M", "fast"),
     ("高画质 · 40 Mbps / medium（更慢更大）", "40M", "medium"),
 ]
+
+# 输出帧率：值 = 传给工具的 --fps（"" = 不传，用工具的默认 60000/1001）
+FPS_CHOICES = [
+    ("59.94 · 相机原生（推荐；30fps 源会被补帧到 59.94，时间翻倍）", ""),
+    ("跟随源 · 30fps/29.97 源保持原速（快一倍、体积减半）", "source"),
+]
+
+# 随包的两个相机原片模板，按"实际输出帧率"选；59.94 那条一直用的 DSC_8955，
+# 29.97 那条用相机 30p 原片 DSC_8960（2026-10-07 的 29.97 通道就是拿它当模板验的）
+BUNDLED_TPLS = {"": "DSC_8955.MOV", "source": "DSC_8960.MOV"}
 # 编码以外的阶段占总耗时约 3%，界面的总进度条按这个权重摊
 STAGE_W = [1, 92, 3, 2, 2, 0]
 STAGE_CUM = [sum(STAGE_W[:i]) for i in range(len(STAGE_W))]
@@ -174,6 +194,7 @@ class App:
         self.gate_ok = False
         self.done_file = None
         self._photo = None
+        self.src_probe = {}          # 最近一次 ffprobe 的源信息（判定帧率用）
 
         prep_env()
         self.tools = {}
@@ -187,6 +208,7 @@ class App:
         self.vars()
         self.build_ui()
         self.apply_mode()
+        self.refresh_fps_notes()
         self.set_state("idle")
 
     def vars(self):
@@ -195,12 +217,12 @@ class App:
         self.var_src = v()
         self.var_outdir = v(value=str(default_outdir()))
         self.var_outname = v(value="DSC_4600.MOV")
-        self.var_tpl = v(value=str(RES / "templates" / "DSC_8955.MOV"))
+        self.var_tpl = v(value=str(RES / "templates" / BUNDLED_TPLS[""]))
         self.var_preset = v(value=PRESETS[0][0])
         self.var_bitrate = v(value=PRESETS[0][1])
         self.var_xpreset = v(value=PRESETS[0][2])
         self.var_size = v(value="1920x1080")
-        self.var_fps = v(value="60000/1001 · 59.94（相机原生）")
+        self.var_fps = v(value=FPS_CHOICES[0][0])
         self.var_start = v()
         self.var_dur = v()
         self.var_noaudio = tk.BooleanVar(value=False)
@@ -394,8 +416,8 @@ class App:
         self.thumb_group(b)          # 缩略图两种模式共用
 
     def build_basic(self, f):
-        self.note(f, "普通模式只用真机验证过的配方：1920×1080 / 59.94fps / "
-                     "H.265(x265) / PCM 24bit，与 Nikon Z5II 原生格式一致。",
+        self.note(f, "普通模式只用真机验证过的配方：1920×1080 / H.265(x265) / "
+                     "PCM 24bit，与 Nikon Z5II 原生格式一致。",
                   fg=INK2, pady=(0, 8))
         g = tk.Frame(f, bg=CARD)
         g.pack(fill="x")
@@ -406,20 +428,24 @@ class App:
                           values=[p[0] for p in PRESETS])
         cb.grid(row=0, column=1, sticky="we")
         cb.bind("<<ComboboxSelected>>", self.on_preset)
-        self.lab(g, "相机模板", fg=INK2, width=9, anchor="e").grid(
+        self.lab(g, "输出帧率", fg=INK2, width=9, anchor="e").grid(
             row=1, column=0, sticky="e", padx=(0, 8), pady=(6, 0))
+        fcb = ttk.Combobox(g, textvariable=self.var_fps, state="readonly",
+                           values=[c[0] for c in FPS_CHOICES])
+        fcb.grid(row=1, column=1, sticky="we", pady=(6, 0))
+        fcb.bind("<<ComboboxSelected>>", self.on_fps)
+        self.lab(g, "相机模板", fg=INK2, width=9, anchor="e").grid(
+            row=2, column=0, sticky="e", padx=(0, 8), pady=(6, 0))
         tpl = tk.Frame(g, bg=CARD)
-        tpl.grid(row=1, column=1, sticky="we", pady=(6, 0))
+        tpl.grid(row=2, column=1, sticky="we", pady=(6, 0))
         ttk.Entry(tpl, textvariable=self.var_tpl).pack(side="left", fill="x",
                                                        expand=True)
         ttk.Button(tpl, text="换一个…", command=self.pick_tpl).pack(side="left",
                                                                     padx=(8, 0))
-        self.note(f, "✓ 输出固定为 1920×1080 / 59.94fps / H.265(x265) / PCM 24bit，"
-                     "与 Nikon Z5II 原生格式一致。", fg=OK, pady=(8, 0))
-        self.note(f, "⚠ 源视频是 30fps 时会被补帧到 59.94，转换时间翻倍 —— "
-                     "这是相机能播的前提，不要改。", fg=WARN)
-        self.note(f, "⚠ 码率别低于 15 Mbps：8 Mbps 档实测相机不认（转得出来、"
-                     "相机不播），本版已去掉该档。", fg=WARN)
+        self.note_basic_fps = self.note(f, "", fg=OK, pady=(8, 0))
+        self.note(f, "⚠ 码率决定体积与耗时：15 Mbps 与相机原生同档（默认）；"
+                     "5 Mbps 实测相机能播、体积约四成，编码也快一倍；"
+                     "40 Mbps 画质更好、更慢更大。", fg=WARN)
 
     def build_adv(self, f):
         self.note(f, "每项可自定义；标「已锁定」的项会破坏相机兼容性，工具不开放。",
@@ -447,13 +473,17 @@ class App:
 
         # 画面
         g = group("画面")
+        fcb = ttk.Combobox(g, textvariable=self.var_fps, state="readonly",
+                           values=[c[0] for c in FPS_CHOICES])
+        fcb.bind("<<ComboboxSelected>>", self.on_fps)
         row(g, 0, "分辨率 --size",
             ttk.Combobox(g, textvariable=self.var_size, state="readonly",
                          values=["1920x1080"]),
-            "输出帧率 --fps",
-            ttk.Entry(g, textvariable=self.var_fps, state="readonly"))
+            "输出帧率 --fps", fcb)
         self.rule(f)
-        self.note(f, "相机 1080p 原生的分辨率与帧率；4K 要配 4K 模板（本版不开放）。")
+        self.note(f, "分辨率与帧率都按相机 1080p 原生规格；4K 要配 4K 模板"
+                     "（本版不开放）。")
+        self.note_adv_fps = self.note(f, "", fg=OK)
         g2 = tk.Frame(f, bg=CARD)
         g2.pack(fill="x")
         g2.columnconfigure(0, minsize=142)
@@ -461,10 +491,10 @@ class App:
         self.lab(g2, "码率 --bitrate", fg=INK2, anchor="e").grid(
             row=0, column=0, sticky="e", padx=(0, 8), pady=4)
         ttk.Combobox(g2, textvariable=self.var_bitrate,
-                     values=["15M", "40M"]).grid(row=0, column=1, sticky="w",
-                                                 pady=4)
-        self.lab(g2, "CBR 近似；15M 与相机原生同档，40M 画质更好、体积翻倍"
-                     "（8M 实测相机不认，别用）",
+                     values=["5M", "15M", "40M"]).grid(row=0, column=1, sticky="w",
+                                                       pady=4)
+        self.lab(g2, "CBR 近似；15M 与相机原生同档、5M 实测相机能播（体积约四成），"
+                     "也可以自己填（如 20M）",
                  fg=INK3, font=F_SMALL).grid(row=0, column=2, sticky="w", padx=8)
 
         # 编码
@@ -481,13 +511,14 @@ class App:
         g.columnconfigure(3, weight=1)
         self.lab(g, "并行段数 --jobs", fg=INK2, anchor="e").grid(
             row=0, column=0, sticky="e", padx=(0, 8), pady=4)
-        self.locked(g, "1 · 单进程（已锁定）").grid(row=0, column=1, sticky="we",
-                                                    pady=4, padx=(0, 18))
+        self.locked(g, "自动 · GOP 对齐 v2（真机验证）").grid(
+            row=0, column=1, sticky="we", pady=4, padx=(0, 18))
         self.lab(g, "mdat 块 --mdat", fg=INK2, anchor="e").grid(
             row=0, column=2, sticky="e", padx=(0, 8), pady=4)
         self.locked(g, "655360（沿用模板）").grid(row=0, column=3, sticky="we", pady=4)
-        self.note(f, "并行段数 >1 实测相机播到中途跳出（DSC_4534/4535）；"
-                     "mdat 按 0.5 秒分块，是相机的要求。", fg=WARN)
+        self.note(f, "并行段数按源自动（时长 ≥25 s 才分段：59.94→4 段、29.97→6 段，"
+                     "段首 IDR 与单进程同位）；6 段并行的 DSC_8965 / DSC_9700 已真机"
+                     "播放通过。mdat 按 0.5 秒分块，是相机的要求。", fg=INK2)
 
         # 截取
         g = group("截取")
@@ -521,11 +552,14 @@ class App:
         ttk.Entry(gt, textvariable=self.var_tpl).grid(row=0, column=1, sticky="we")
         ttk.Button(gt, text="浏览…", command=self.pick_tpl).grid(row=0, column=2,
                                                                  padx=(8, 0))
-        ttk.Button(gt, text="恢复默认", command=lambda: self.var_tpl.set(
-            str(RES / "templates" / "DSC_8955.MOV"))).grid(row=0, column=3, padx=(6, 0))
+        ttk.Button(gt, text="恢复默认", command=self.reset_tpl).grid(row=0, column=3,
+                                                                     padx=(6, 0))
         self.note(f, "必须用相机自己录的同规格 MOV 当模板：容器结构、时间基、"
-                     "缩略图都照抄它。tkhd 时长为可播放长度，由工具按模板写入，"
-                     "不提供修改项（改了这个相机快进越界会卡死）。", pady=(4, 0))
+                     "缩略图都照抄它。随包两个相机原片：59.94 输出配 "
+                     "templates\\DSC_8955.MOV、29.97 输出配 templates\\DSC_8960.MOV"
+                     "（选帧率时自动切换）。tkhd 时长为可播放长度，由工具按模板"
+                     "写入，不提供修改项（改了这个相机快进越界会卡死）。",
+                  pady=(4, 0))
 
     def thumb_group(self, parent):
         """缩略图：普通/高级模式共用的一个块。"""
@@ -661,10 +695,11 @@ class App:
         self.var_tpl.trace_add("write", lambda *_: self.sync_status())
 
     def sync_status(self):
-        """右下那行：门禁状态 + 当前模板 + 版本。门禁过了要真的显示出来。"""
+        """右下那行：门禁状态 + 输出帧率 + 当前模板 + 版本。门禁过了要显示出来。"""
         self.lbl_tpl.configure(
             text=("门禁 43/43 通过 · " if self.gate_ok else "门禁未运行 · ")
-            + f"模板 {Path(self.var_tpl.get()).name} · {APP_VERSION}")
+            + f"输出 {self.fps_text()} · 模板 {Path(self.var_tpl.get()).name} · "
+            + APP_VERSION)
 
     # ---------- 模式 / 缩略图 ----------
     def apply_mode(self):
@@ -692,6 +727,80 @@ class App:
             if label == self.var_preset.get():
                 self.var_bitrate.set(br)
                 self.var_xpreset.set(pr)
+
+    # ---------- 输出帧率 / 模板配套 ----------
+    @staticmethod
+    def fps_key_of(label):
+        for text, key in FPS_CHOICES:
+            if text == label:
+                return key
+        return ""
+
+    def fps_key(self):
+        """用户选的输出帧率模式："" = 59.94 原生，或 "source" = 跟随源。"""
+        return self.fps_key_of(self.var_fps.get())
+
+    def src_fps(self):
+        fr = (self.src_probe or {}).get("r_frame_rate", "") or ""
+        try:
+            n, d = (float(x) for x in fr.split("/"))
+            return n / d if d else 0.0
+        except Exception:
+            return 0.0
+
+    def fps_eff(self):
+        """实际生效的帧率模式：「跟随源」只对真 30fps/29.97 的源有效。"""
+        f = self.src_fps()
+        if self.fps_key() == "source" and 29.5 <= f <= 30.5:
+            return "source"
+        return ""
+
+    def fps_text(self):
+        return "29.97（跟随源）" if self.fps_eff() == "source" else "59.94"
+
+    def tpl_default(self, key=None):
+        return RES / "templates" / BUNDLED_TPLS[
+            self.fps_eff() if key is None else key]
+
+    def is_bundled_tpl(self):
+        name = Path(self.var_tpl.get().strip() or ".").name
+        return name in tuple(BUNDLED_TPLS.values())
+
+    def reset_tpl(self):
+        self.var_tpl.set(str(self.tpl_default()))
+
+    def on_fps(self, _e=None):
+        self.sync_tpl_for_fps()
+        self.refresh_fps_notes()
+
+    def sync_tpl_for_fps(self):
+        """选 29.97 就把随包的 59.94 模板换成 30fps 那个（只动随包模板，
+        用户自己挑的模板不碰）。"""
+        want = str(self.tpl_default())
+        if self.is_bundled_tpl() and self.var_tpl.get().strip() != want:
+            self.var_tpl.set(want)
+
+    def refresh_fps_notes(self):
+        key = self.fps_eff()
+        if key == "source":
+            txt = ("✓ 跟随源：输出 1920×1080 / 29.97fps（源就是 30fps），与相机 "
+                   "30p 模式同规格；43/43 门禁与真机播放都已验证（DSC_9700）。"
+                   "不补帧，编码时间与体积都约为 59.94 的一半。")
+            fg = OK
+        elif self.fps_key() == "source":
+            txt = (f"⚠ 源不是 30fps（{self.src_fps():.2f}fps）：「跟随源」只对 "
+                   "30fps/29.97 源生效，本次已按 59.94 输出（相机原生）。")
+            fg = WARN
+        else:
+            txt = ("✓ 输出固定为 1920×1080 / 59.94fps / H.265(x265) / PCM 24bit，"
+                   "与 Nikon Z5II 原生格式一致。源是 30fps 时会被补帧到 59.94，"
+                   "时间翻倍 —— 想省一半时间就选「跟随源」。")
+            fg = OK
+        for lb in (getattr(self, "note_basic_fps", None),
+                   getattr(self, "note_adv_fps", None)):
+            if lb is not None:
+                lb.configure(text=txt, fg=fg)
+        self.sync_tpl_for_fps()
 
     def thumb_mode(self):
         mode = self.var_thumb_mode.get()
@@ -754,26 +863,46 @@ class App:
         src = self.var_src.get().strip()
 
         def job():
-            info = {}
-            try:
-                r = subprocess.run(
-                    [ffbin("ffprobe"), "-v", "error", "-show_entries",
-                     "format=duration:stream=codec_type,width,height,r_frame_rate",
-                     "-of", "default=nw=1", src],
-                    capture_output=True, text=True, encoding="utf-8",
-                    errors="replace", timeout=60)
-                for line in (r.stdout or "").splitlines():
-                    k, _, v = line.partition("=")
-                    info[k] = v
-            except Exception:
+            info = self.probe_info(src)
+            if not info:
                 return
             self.root.after(0, self.show_srcinfo, info)
 
         threading.Thread(target=job, daemon=True).start()
 
+    @staticmethod
+    def probe_info(src):
+        """同步探一次（冒烟测试要当场判定帧率，不能等线程）。
+
+        用 JSON 而不是 `default=nw=1` 的平铺输出：平铺时每个流都打一遍同样的键，
+        dict 会被**音频流覆盖**（`r_frame_rate=0/0`），害得"跟随源"永远判不出 30fps
+        （2026-10-07 冒烟抓到的问题）。
+        """
+        info = {}
+        try:
+            r = subprocess.run(
+                [ffbin("ffprobe"), "-v", "error", "-print_format", "json",
+                 "-show_format", "-show_streams", src],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=60)
+            j = json.loads(r.stdout or "{}")
+        except Exception:
+            return {}
+        streams = j.get("streams") or []
+        vid = next((s for s in streams if s.get("codec_type") == "video"), {})
+        for k in ("width", "height", "r_frame_rate"):
+            if vid.get(k) is not None:
+                info[k] = str(vid[k])
+        info["duration"] = str((j.get("format") or {}).get("duration") or "")
+        info["codec_type"] = "video" if vid else ""
+        info["has_audio"] = "1" if any(s.get("codec_type") == "audio"
+                                       for s in streams) else ""
+        return info
+
     def show_srcinfo(self, i):
         if not i:
             return
+        self.src_probe = dict(i)
         try:
             w, h = i.get("width"), i.get("height")
             fr = i.get("r_frame_rate", "")
@@ -783,20 +912,25 @@ class App:
                 if d:
                     fps = f"{n / d:.2f}fps"
             dur = float(i.get("duration") or 0) or None
-            audio = "含音频" if i.get("codec_type") == "audio" or self.has_audio(i) else "无音频"
+            audio = "含音频" if self.has_audio(i) else "无音频"
             est = ""
             if dur:
                 f = 6 if self.var_xpreset.get() in ("fast", "faster", "veryfast") else 15
+                if self.fps_eff() == "source":
+                    f /= 2         # 不补帧，帧数只有一半
                 est = f" · 预计转换约 {max(1, round(dur * f / 60))} 分钟（粗估）"
+            out_fps = ("29.97fps（跟随源）" if self.fps_eff() == "source"
+                       else "59.94fps")
             self.var_srcinfo.set(
                 f"源 {w}×{h} · {fps} · {fmt_secs(dur)} · {audio}   →   "
-                f"输出 1920×1080 · 59.94fps · H.265(x265) / PCM 24bit{est}")
+                f"输出 1920×1080 · {out_fps} · H.265(x265) / PCM 24bit{est}")
         except Exception:
             pass
+        self.refresh_fps_notes()
 
     @staticmethod
     def has_audio(i):
-        return i.get("codec_type") == "audio"
+        return bool(i.get("has_audio")) or i.get("codec_type") == "audio"
 
     def make_preview(self):
         """抽一帧给界面看（跟输出无关，纯粹是"我要的是不是这一帧"）。"""
@@ -1008,7 +1142,7 @@ class App:
             if not img or not Path(img).exists():
                 return messagebox.showerror("错误", "选一张存在的图片当缩略图")
             argv += ["--thumb-image", img]
-        # 高级模式的可选项；锁死的项（encoder/jobs/fps/size）一律不传，用工具默认值
+        # 高级模式的可选项；锁死的项（encoder/mdat/size）一律不传，用工具默认值
         if self.var_mode.get() == "adv":
             if self.var_noaudio.get():
                 argv.append("--no-audio")
@@ -1021,6 +1155,16 @@ class App:
                 argv += ["--start", st]
             if du:
                 argv += ["--duration", du]
+
+        # 输出帧率：59.94 是工具默认（不传）；「跟随源」只在源确实是 30fps/29.97
+        # 时传 --fps source（那时工具会归一到相机的 30000/1001 时基）
+        if self.fps_eff() == "source":
+            argv += ["--fps", "source"]
+
+        # 分段并行 v2（GOP 对齐，段首 IDR 与单进程同位）：交给工具按时长/帧率
+        # 自动定段数（59.94→4 段、29.97→6 段，时长 <25 s 退单进程）。
+        # 6 段并行的产物 DSC_8965（5M/29.97）与 DSC_9700 已真机播放通过。
+        argv += ["--jobs", "0"]
 
         self.done_file = None
         self.gate_ok = False
@@ -1219,13 +1363,17 @@ def auto_smoke():
     结果写进 --report 文件（--windowed 的 exe 没有 stdout 可看）。
 
         app.exe --auto <源视频> --outdir <目录> --outname DSC_4700.MOV
-                --report <结果文件>
+                --report <结果文件> [--fps-mode 59.94|source]
+
+    --fps-mode source 会走界面的「跟随源」那条路（列表选 29.97、换 30fps 模板），
+    用来冒烟 30fps 通道。
     """
     a = sys.argv
     src = a[a.index("--auto") + 1]
     outdir = a[a.index("--outdir") + 1] if "--outdir" in a else str(Path(src).parent)
     name = a[a.index("--outname") + 1] if "--outname" in a else "DSC_4700.MOV"
     report = Path(a[a.index("--report") + 1]) if "--report" in a else WORK / "auto-report.txt"
+    want_fps = a[a.index("--fps-mode") + 1].lower() if "--fps-mode" in a else ""
 
     headless_modals()
     t0 = time.time()
@@ -1234,6 +1382,15 @@ def auto_smoke():
     app.var_src.set(str(Path(src).resolve()))
     app.var_outdir.set(outdir)
     app.var_outname.set(name)
+    # 同步探一次，这样「跟随源」能不能生效当场就定了
+    app.src_probe = App.probe_info(str(Path(src).resolve()))
+    app.show_srcinfo(app.src_probe)
+    if want_fps:
+        for text, key in FPS_CHOICES:
+            if key == ("" if want_fps.startswith("59") else want_fps):
+                app.var_fps.set(text)
+                break
+        app.on_fps()
     app.probe_src()
     state = {"ok": False, "why": "超时"}
 
@@ -1252,6 +1409,8 @@ def auto_smoke():
             f"输出存在   : {Path(out).exists()}"
             + (f"（{Path(out).stat().st_size:,} B）" if Path(out).exists() else ""),
             f"界面状态   : {app.state}   门禁通过: {app.gate_ok}",
+            f"输出帧率   : {app.fps_text()}   模板: {Path(app.var_tpl.get()).name}",
+            f"码率/预设  : {app.var_bitrate.get()} / {app.var_xpreset.get()}",
             f"拷卡模块   : {copy_ok}",
             f"按钮       : ①{app.btn_go.cget('state')} ②{app.btn_ver.cget('state')}"
             f" ③{app.btn_copy.cget('state')}",
