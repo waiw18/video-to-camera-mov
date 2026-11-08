@@ -1,30 +1,10 @@
-"""相机视频转换器 —— 图形界面入口（tkinter，卡片式）。
+﻿#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""相机视频转换器：把普通视频批量转成 Nikon Z5II 能直接播放的 MOV。
 
-可以两种方式跑：
-  1) 源码运行：python app/main.py
-  2) 打包后：相机视频转换器.exe（PyInstaller，见 app/build-exe.ps1）
-
-打包后**不需要额外的 Python**：工具模块被 PyInstaller 一起冻结，
-这里用 importlib 在进程内加载它们（工具本身只用 subprocess 调 ffmpeg）。
-
-界面按 design/前端设计稿-v1.html 的卡片式排版实现。锁死的项（在界面上写明原因）：
-    · 编码器 x265（NVENC 会产出相机不认的文件）
-    · mdat 块 655360（0.5 秒分块，相机的要求）
-    · 码流容器参数一律由工具按相机实测值写（tkhd.duration 保持模板原值）
-并行段数走工具的自动值（--jobs 0，GOP 对齐 v2）：时长 ≥25 s 才分段，
-59.94 → 4 段、29.97 → 6 段，每段线程按段数均分；6 段并行的产物（DSC_8965 /
-DSC_9700）2026-10-07 真机播放通过，所以 2026-10-02 那条"jobs>1 跳出"的
-老结论只对没做 GOP 对齐的 v1 成立。
-
-输出帧率是可选项（2026-10-07 起，29.97 通道已真机验证）：
-    · 59.94（相机原生，默认）：任何源都补/抽到 59.94，30fps 源会补帧、时间翻倍
-    · 跟随源：源是 30fps/29.97 时保持原速（快一倍、体积减半），其它源自动退回 59.94
-29.97 输出默认换成同规格的 30fps 模板（templates/DSC_8960.MOV，相机原片）。
-
-流程：转换 → 自动跑 43 项门禁 → 门禁全过才允许"拷到卡上"。
-进度靠工具 stdout 上的协议行（见 tools/video-to-camera-mov.py 的 _emit）：
-    ##CAMMOV {"k":"prog","pct":42.3,"eta":1003,...}
-这些行不进日志区，只驱动进度卡片。
+    python app/main.py                 # 界面
+    python app/main.py --selftest --report r.txt
+    python app/main.py --auto <源> --outdir <目录> --outname DSC_4700.MOV --report r.txt
 """
 import importlib.util
 import io
@@ -36,15 +16,14 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
 
 FROZEN = getattr(sys, "frozen", False)
 
 
 def res_dir():
-    """资源目录：打包后在 _MEIPASS，源码运行时在项目根。"""
     if FROZEN:
         return Path(sys._MEIPASS)
     return Path(__file__).resolve().parent.parent
@@ -52,29 +31,22 @@ def res_dir():
 
 RES = res_dir()
 TOOLS = RES / "tools"
-# 工作目录（中间文件）：放在 exe 旁边，别写进 _MEIPASS
 WORK = Path(sys.executable).parent / ".camwork" if FROZEN else RES / ".probe"
 
 
 def default_outdir():
-    """默认输出目录。
-
-    打包后**不能**默认写进程序自己的目录：单文件版解包在临时目录（_MEIPASS），
-    程序一退出连转换好的视频一起没了。放系统"视频"文件夹下最不容易找不到。
-    """
     if not FROZEN:
         return RES / "output"
-    home = Path.home()
-    base = home / "Videos"
+    base = Path.home() / "Videos"
     if not base.is_dir():
-        base = home
+        base = Path.home()
     return base / "相机转换输出"
 
-APP_VERSION = "v0.1.0-beta.2"
-MAXW = 1010                                  # 内容列最宽，再宽就居中留白
-CANCEL_FLAG = WORK / "cancel.flag"          # 取消转换用（工具 run_prog 会轮询）
 
-# ---- 设计稿里的色板（design/前端设计稿-v1.html）----
+APP_VERSION = "v0.1.0-beta.3"
+MAXW = 1010
+CANCEL_FLAG = WORK / "cancel.flag"
+
 BG = "#eceef1"
 CARD = "#ffffff"
 INK = "#1c2024"
@@ -88,8 +60,6 @@ ACCENT_SOFT = "#eaf1fd"
 OK = "#1a7f4b"
 OK_SOFT = "#e8f5ee"
 WARN = "#9a6700"
-WARN_SOFT = "#fdf6e3"
-WARN_LINE = "#f0e0b8"
 DANGER = "#b42318"
 LOG_BG = "#1b1f24"
 LOG_INK = "#d7dee6"
@@ -97,40 +67,24 @@ LOG_DIM = "#8b959f"
 LOG_OK = "#7fd18b"
 LOG_BAD = "#ff9a90"
 LOG_WARN = "#ffd479"
-BOX = "#dfe4ea"
 
 F_BODY = ("Microsoft YaHei UI", 10)
 F_TITLE = ("Microsoft YaHei UI", 10, "bold")
 F_SMALL = ("Microsoft YaHei UI", 9)
-F_BIG = ("Microsoft YaHei UI", 12, "bold")
+F_BIG = ("Microsoft YaHei UI", 13, "bold")
 F_MONO = ("Consolas", 9)
 
-# 普通模式的预设（都是真机验证过的组合）
-# 5 Mbps 档 2026-10-07 真机验证可播（DSC_8965：213.8 MB / 4.76 Mbit/s，43/43 门禁）；
-# 早期"8 Mbps 相机不认"的结论已作废（那次没有产物/日志留存，原因未查清），
-# 所以不再写"码率别低于 15 Mbps"这种一刀切的话。
-PRESETS = [
-    ("推荐 · 15 Mbps / fast（真机验证）", "15M", "fast"),
-    ("小体积 · 5 Mbps / fast（真机验证可播）", "5M", "fast"),
-    ("高画质 · 40 Mbps / medium（更慢更大）", "40M", "medium"),
+QUALITY = [
+    ("小体积 · 5 Mbps", "5M", "fast", "体积约四成，编码快一倍"),
+    ("推荐 · 15 Mbps", "15M", "fast", "与相机原生同档"),
+    ("高画质 · 40 Mbps", "40M", "medium", "更清楚，也更慢更大"),
 ]
-
-# 输出帧率：值 = 传给工具的 --fps（"" = 不传，用工具的默认 60000/1001）
-FPS_CHOICES = [
-    ("59.94 · 相机原生（推荐；30fps 源会被补帧到 59.94，时间翻倍）", ""),
-    ("跟随源 · 30fps/29.97 源保持原速（快一倍、体积减半）", "source"),
-]
-
-# 随包的两个相机原片模板，按"实际输出帧率"选；59.94 那条一直用的 DSC_8955，
-# 29.97 那条用相机 30p 原片 DSC_8960（2026-10-07 的 29.97 通道就是拿它当模板验的）
-BUNDLED_TPLS = {"": "DSC_8955.MOV", "source": "DSC_8960.MOV"}
-# 编码以外的阶段占总耗时约 3%，界面的总进度条按这个权重摊
-STAGE_W = [1, 92, 3, 2, 2, 0]
-STAGE_CUM = [sum(STAGE_W[:i]) for i in range(len(STAGE_W))]
+BUNDLED_TPLS = {"59.94": "DSC_8955.MOV", "29.97": "DSC_8960.MOV"}
+AUDIO_PAIRS = (("-30064", "-30232"), ("-30033", "-30216"))
+VIDEO_EXT = "*.mp4 *.mov *.mkv *.avi *.ts *.flv *.webm *.m4s"
 
 
 def prep_env():
-    """把 ffmpeg 与工作目录告诉工具（它们支持这两个环境变量）。"""
     bindir = RES / "bin"
     for name in ("ffmpeg", "ffprobe"):
         p = bindir / f"{name}.exe"
@@ -148,7 +102,6 @@ def load_tool(filename, modname):
 
 
 def ffbin(name):
-    """ffmpeg / ffprobe 的可执行路径（跟工具用同一套环境变量约定）。"""
     v = os.environ.get("CAMMOV_" + name.upper())
     if v and Path(v).exists():
         return v
@@ -157,85 +110,136 @@ def ffbin(name):
 
 def fmt_secs(s):
     if s is None:
-        return "—"
-    s = int(max(0, s))
-    return f"{s // 60:02d}:{s % 60:02d}"
+        return "--:--"
+    s = max(0, int(round(float(s))))
+    h, m, sec = s // 3600, s % 3600 // 60, s % 60
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
 
 
 def fmt_size(n):
-    if not n:
-        return "—"
-    for unit, div in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
-        if n >= div:
-            return f"{n / div:.1f} {unit}"
-    return f"{n} B"
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:,.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} GB"
+
+
+def probe_info(src):
+    info = {}
+    try:
+        r = subprocess.run(
+            [ffbin("ffprobe"), "-v", "error", "-print_format", "json",
+             "-show_format", "-show_streams", str(src)],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=60)
+        j = json.loads(r.stdout or "{}")
+    except Exception:
+        return {}
+    streams = j.get("streams") or []
+    vid = next((s for s in streams if s.get("codec_type") == "video"), {})
+    for k in ("width", "height", "r_frame_rate"):
+        if vid.get(k) is not None:
+            info[k] = str(vid[k])
+    info["duration"] = str((j.get("format") or {}).get("duration") or "")
+    info["codec_type"] = "video" if vid else ""
+    info["has_audio"] = "1" if any(s.get("codec_type") == "audio"
+                                   for s in streams) else ""
+    return info
+
+
+def src_fps(info):
+    try:
+        n, d = (float(x) for x in (info.get("r_frame_rate") or "").split("/"))
+        return n / d if d else 0.0
+    except Exception:
+        return 0.0
+
+
+def grab_frame(src, secs, png, width=160):
+    cmd = [ffbin("ffmpeg"), "-y", "-v", "error"]
+    if secs:
+        cmd += ["-ss", f"{secs:g}"]
+    cmd += ["-i", str(src), "-map", "0:v:0", "-frames:v", "1",
+            "-vf", f"scale={width}:-2", "-f", "image2", str(png)]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=120)
+    except Exception:
+        return None
+    return png if Path(png).exists() else None
+
+
+def frame_std(png):
+    try:
+        from PIL import Image
+        import numpy as np
+        with Image.open(png) as im:
+            a = np.asarray(im.convert("L"), dtype="float32")
+        return float(a.std())
+    except Exception:
+        return 0.0
+
+
+def auto_thumb(src):
+    """首帧如果是纯色（白场/黑场），退到第一个有内容的帧。"""
+    for i, t in enumerate((0, 1, 2, 3, 5, 8, 12)):
+        png = WORK / f"th-auto-{i}.png"
+        if grab_frame(src, t, png) and frame_std(png) > 12:
+            return png if t else None
+    return None
 
 
 class App:
-    # ---------- 构造 ----------
     def __init__(self, root):
         self.root = root
         root.title("相机视频转换器")
-        # 屏幕小或系统缩放在 125%/150% 时，固定的 1000x840 会超出屏幕（Tk 的坐标
-        # 是逻辑像素，Windows 会按缩放比放大），所以按屏幕尺寸收一下。
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        # 本进程没做 DPI 感知，Windows 会把窗口整体放大（本机 150%：Tk 看到
-        # 1707x1067 的虚拟桌面，1 单位 = 1.5 物理像素），所以尺寸要取屏幕再收一截，
-        # 留出任务栏和标题栏；sh-56 是被压到的极限，再小就放不下内容列了。
-        w, h = min(MAXW + 40, sw - 80), min(950, sh - 56)
-        w, h = max(w, 780), max(h, 560)
-        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+20")
-        root.minsize(min(880, w), min(560, h))
+        w, h = min(MAXW + 40, sw - 80), min(900, sh - 56)
+        root.geometry(f"{max(w, 800)}x{max(h, 620)}+{max(0, (sw - w) // 2)}+20")
+        root.minsize(800, 620)
         root.configure(bg=BG)
 
         self.busy = False
-        self.t_start = 0.0
         self.cancel_asked = False
+        self.state = "idle"
+        self.items = []
+        self.qi = 0
+        self.cur_item = None
+        self.enc_pct = None
+        self.t_start = 0.0
         self.gate_ok = False
         self.done_file = None
-        self._photo = None
-        self.src_probe = {}          # 最近一次 ffprobe 的源信息（判定帧率用）
-        self.used = {}               # 这次转换真正传给工具的参数（冒烟报告用）
+        self.used = {}
+        self.seq = 0
+        self.mode = "pick"
 
         prep_env()
         self.tools = {}
         try:
             self.tools["conv"] = load_tool("video-to-camera-mov.py", "convmod")
             self.tools["verify"] = load_tool("verify-output.py", "verifymod")
+            self.tools["split"] = load_tool("split-m4s.py", "splitmod")
         except Exception:
             messagebox.showerror("加载失败", traceback.format_exc())
 
         self.styles()
         self.vars()
         self.build_ui()
-        self.apply_mode()
-        self.refresh_fps_notes()
         self.set_state("idle")
 
     def vars(self):
         v = tk.StringVar
-        self.var_mode = v(value="basic")
-        self.var_src = v()
         self.var_outdir = v(value=str(default_outdir()))
-        self.var_outname = v(value="DSC_4600.MOV")
-        self.var_tpl = v(value=str(RES / "templates" / BUNDLED_TPLS[""]))
-        self.var_preset = v(value=PRESETS[0][0])
-        self.var_bitrate = v(value=PRESETS[0][1])
-        self.var_xpreset = v(value=PRESETS[0][2])
-        self.var_size = v(value="1920x1080")
-        self.var_fps = v(value=FPS_CHOICES[0][0])
-        self.var_start = v()
-        self.var_dur = v()
-        self.var_noaudio = tk.BooleanVar(value=False)
-        self.var_time = v(value="now")
-        self.var_nothumbs = tk.BooleanVar(value=False)
-        self.var_keep = tk.BooleanVar(value=False)
-        self.var_thumb_mode = v(value="first")
-        self.var_thumb_sec = tk.DoubleVar(value=0.0)
-        self.var_thumb_img = v()
-        self.var_srcinfo = v()
+        self.var_quality = tk.IntVar(value=1)
+        self.var_verify = tk.BooleanVar(value=True)
+        self.var_more = tk.BooleanVar(value=False)
+        self.var_log = tk.BooleanVar(value=False)
+        self.var_tpl = v(value="自动")
+        self.var_thumb = v(value="自动")
+        self.var_pieces = tk.IntVar(value=1)
+        self.tpl_path = ""
+        self.thumb_path = ""
 
-    # ---------- ttk 样式：把 clam 调成设计稿的"白卡片 + 细线" ----------
     def styles(self):
         S = ttk.Style()
         try:
@@ -245,758 +249,539 @@ class App:
         S.configure("TEntry", fieldbackground=CARD, foreground=INK, bordercolor=LINE,
                     lightcolor=LINE, darkcolor=LINE, insertcolor=INK, padding=4)
         S.map("TEntry", bordercolor=[("focus", ACCENT)])
-        S.configure("TCombobox", fieldbackground=CARD, background=CARD, bordercolor=LINE,
-                    lightcolor=LINE, darkcolor=LINE, arrowcolor=INK2, padding=4,
-                    selectbackground=CARD, selectforeground=INK)
+        S.configure("TCombobox", fieldbackground=CARD, background=CARD,
+                    bordercolor=LINE, lightcolor=LINE, darkcolor=LINE,
+                    arrowcolor=INK2, padding=4, selectbackground=CARD,
+                    selectforeground=INK)
         S.map("TCombobox", bordercolor=[("focus", ACCENT)],
               fieldbackground=[("readonly", CARD)])
-        S.configure("TCheckbutton", background=CARD, foreground=INK, focuscolor=CARD,
-                    padding=2)
-        S.map("TCheckbutton", background=[("active", CARD)],
-              foreground=[("disabled", INK3)])
         S.configure("TButton", background="#f4f6f8", foreground=INK, bordercolor=LINE,
                     lightcolor="#f4f6f8", darkcolor="#f4f6f8", relief="flat",
-                    padding=(12, 6), focusthickness=0, font=F_BODY, arrowcolor=INK2,
-                    width=0)   # clam 默认 -width -11：不归零的话所有按钮一样宽
-        S.map("TButton",
-              background=[("active", "#e9edf1"), ("disabled", "#f2f4f6")],
-              foreground=[("disabled", INK3)],
-              bordercolor=[("disabled", LINE)])
+                    padding=(12, 6), focusthickness=0, font=F_BODY, width=0)
+        S.map("TButton", background=[("active", "#e9edf1"), ("disabled", "#f2f4f6")],
+              foreground=[("disabled", INK3)])
         S.configure("Primary.TButton", background=ACCENT, foreground="#ffffff",
                     bordercolor=ACCENT, lightcolor=ACCENT, darkcolor=ACCENT,
-                    padding=(18, 8), font=F_TITLE)
+                    padding=(20, 9), font=F_TITLE)
         S.map("Primary.TButton",
               background=[("active", ACCENT_D), ("disabled", "#a9c2e6")],
-              foreground=[("disabled", "#eef3fb")],
-              bordercolor=[("active", ACCENT_D), ("disabled", "#a9c2e6")])
-        S.configure("Cam.Horizontal.TProgressbar", troughcolor=LINE2, background=ACCENT,
-                    bordercolor=LINE2, lightcolor=ACCENT, darkcolor=ACCENT, thickness=8)
-
-    # ---------- 小工具 ----------
-    @staticmethod
-    def card(parent, title, note=""):
-        """白底细线卡片：返回 (外壳, 内容区)。"""
-        outer = tk.Frame(parent, bg=CARD, highlightbackground=LINE,
-                         highlightthickness=1)
-        head = tk.Frame(outer, bg=CARD)
-        head.pack(fill="x", padx=14, pady=(9, 5))
-        tk.Label(head, text=title, bg=CARD, fg=INK, font=F_TITLE).pack(side="left")
-        if note:
-            tk.Label(head, text=note, bg=CARD, fg=INK3, font=F_SMALL).pack(side="right")
-        body = tk.Frame(outer, bg=CARD)
-        body.pack(fill="x", padx=14, pady=(0, 10))
-        return outer, body
-
-    @staticmethod
-    def lab(parent, text, fg=INK, font=F_BODY, width=None, bg=CARD, anchor="w"):
-        return tk.Label(parent, text=text, bg=bg, fg=fg, font=font,
-                        width=width, anchor=anchor)
-
-    def note(self, parent, text, fg=INK3, font=F_SMALL, pady=(2, 0)):
-        """整行说明：跟随父容器宽度自动折行，不然窄窗口里右边会被切掉。"""
-        lb = tk.Label(parent, text=text, bg=CARD, fg=fg, font=font, anchor="w",
-                      justify="left")
-        lb.pack(fill="x", pady=pady)
-        parent.bind("<Configure>",
-                    lambda e, l=lb: l.configure(wraplength=max(240, e.width - 6)),
-                    add="+")
-        return lb
-
-    def locked(self, parent, text, note=""):
-        """琥珀色"已锁定"格子：看得见、改不了、写明原因。"""
-        box = tk.Frame(parent, bg=WARN_SOFT, highlightbackground=WARN_LINE,
-                       highlightthickness=1)
-        tk.Label(box, text="🔒", bg=WARN_SOFT, fg=WARN, font=F_SMALL).pack(
-            side="left", padx=(6, 2), pady=3)
-        tk.Label(box, text=text, bg=WARN_SOFT, fg=WARN, font=F_BODY).pack(
-            side="left", padx=(0, 8), pady=3)
-        if note:
-            tk.Label(parent, text=note, bg=CARD, fg=WARN, font=F_SMALL, anchor="w",
-                     wraplength=460, justify="left").pack(fill="x")
-        return box
-
-    @staticmethod
-    def rule(parent):
-        tk.Frame(parent, bg=LINE2, height=1).pack(fill="x", pady=(4, 6))
+              foreground=[("disabled", "#eef3fb")])
+        S.configure("Cam.Horizontal.TProgressbar", troughcolor=LINE2,
+                    background=ACCENT, bordercolor=LINE2, lightcolor=ACCENT,
+                    darkcolor=ACCENT, thickness=8)
+        S.configure("Cam.Treeview", font=F_BODY, rowheight=28, background=CARD,
+                    fieldbackground=CARD, foreground=INK, borderwidth=0)
+        S.configure("Cam.Treeview.Heading", font=F_SMALL, foreground=INK3,
+                    background=CARD, relief="flat")
+        S.map("Cam.Treeview", background=[("selected", ACCENT_SOFT)],
+              foreground=[("selected", INK)])
 
     # ---------- 界面 ----------
     def build_ui(self):
-        # 顶部：模式切换（普通/高级）
-        top = tk.Frame(self.root, bg=BG)
-        top.pack(fill="x", padx=14, pady=(10, 0))
-        seg = tk.Frame(top, bg=BG)
-        seg.pack(side="left")
-        for text, val in (("普通模式", "basic"), ("高级模式", "adv")):
-            tk.Radiobutton(seg, text=text, value=val, variable=self.var_mode,
-                           indicatoron=0, command=self.apply_mode, bg=LINE2, fg=INK,
-                           selectcolor=ACCENT_SOFT, activebackground=ACCENT_SOFT,
-                           activeforeground=INK, relief="flat", bd=0, padx=16, pady=6,
-                           font=F_BODY, highlightthickness=1,
-                           highlightbackground=LINE, cursor="hand2").pack(side="left")
-        self.lab(top, "Nikon Z5II · 1080p59.94 / H.265", fg=INK3, font=F_SMALL).pack(
-            side="right", pady=6)
+        head = tk.Frame(self.root, bg=BG)
+        head.pack(fill="x", padx=20, pady=(14, 8))
+        tk.Label(head, text="相机视频转换器", bg=BG, fg=INK, font=F_BIG).pack(side="left")
+        tk.Label(head, text="Nikon Z5II · 1080p / H.265 / PCM", bg=BG, fg=INK3,
+                 font=F_SMALL).pack(side="left", padx=(10, 0), pady=(6, 0))
+        tk.Label(head, text=APP_VERSION, bg=BG, fg=INK3, font=F_SMALL).pack(
+            side="right", pady=(6, 0))
 
-        # 固定的底部区（操作 + 进度）：窗口小的时候"开始转换/取消"必须一直在手边，
-        # 所以它们不跟着设置区一起滚。先 pack 的就先占位，顺序不能调。
-        self.statusbar()
         self.bottom = tk.Frame(self.root, bg=BG)
-        self.bottom.pack(side="bottom", fill="x")
-
-        # 主体：可滚动（高级模式很高，窗口小的时候要能滚）
-        wrap = tk.Frame(self.root, bg=BG)
-        wrap.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0)
-        vs = ttk.Scrollbar(wrap, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=vs.set)
-        vs.pack(side="right", fill="y")
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.body = tk.Frame(self.canvas, bg=BG)
-        self.win = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
-        self.body.bind("<Configure>", lambda e: self.canvas.configure(
-            scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", self.on_canvas_resize)
-        self.root.bind_all("<MouseWheel>", self.on_wheel)
-
-        self.card_io()
-        self.card_params()
+        self.bottom.pack(side="bottom", fill="x", padx=20, pady=(8, 12))
+        self.log_head = tk.Frame(self.root, bg=BG)
+        self.log_head.pack(side="bottom", fill="x", padx=20)
         self.card_log()
-        self.card_actions(self.bottom)
-        self.card_progress(self.bottom)
+        self.card_source()
+        self.card_quality()
+        self.card_bottom()
+        self.more_panel = tk.Frame(self.root, bg=CARD, highlightthickness=1,
+                                   highlightbackground=LINE)
 
-    def on_canvas_resize(self, e):
-        """内容列最宽 MAXW 并在窗口里居中：窗口拉宽时不至于一行拉成两米长。"""
-        w = min(e.width - 4, MAXW)
-        self.canvas.itemconfigure(self.win, width=w)
-        self.canvas.coords(self.win, max(0, (e.width - w) // 2), 0)
+    def card_source(self):
+        outer = self.card("来源")
+        outer.pack(fill="both", expand=True, padx=20, pady=(0, 0))
+        body = tk.Frame(outer, bg=CARD)
+        body.pack(fill="both", expand=True, padx=16, pady=(2, 12))
 
-    def on_wheel(self, e):
-        """滚轮滚整页；鼠标在日志框里时不抢（让它自己滚）。"""
-        try:
-            w = self.root.winfo_containing(e.x_root, e.y_root)
-        except Exception:
-            w = None
-        if isinstance(w, tk.Text):
-            return
-        self.canvas.yview_scroll(int(-e.delta / 120), "units")
+        tabs = tk.Frame(body, bg=CARD)
+        tabs.pack(fill="x", pady=(2, 8))
+        self.tab_btns = {}
+        for key, text in (("pick", "选择视频"), ("merge", "合并视频")):
+            b = tk.Button(tabs, text=text, relief="flat", bd=0, font=F_TITLE,
+                          padx=14, pady=4, cursor="hand2",
+                          command=lambda k=key: self.set_mode(k))
+            b.pack(side="left", padx=(0, 6))
+            self.tab_btns[key] = b
 
-    # ①输入与输出
-    def card_io(self):
-        outer, b = self.card(self.body, "① 输入与输出",
-                             "支持 mp4 / mov / mkv / avi / ts / flv / webm")
-        outer.pack(fill="x", padx=14, pady=(10, 0))
-        g = tk.Frame(b, bg=CARD)
-        g.pack(fill="x")
-        g.columnconfigure(1, weight=1)
-        rows = (("输入文件", self.var_src, self.pick_src),
-                ("输出目录", self.var_outdir, self.pick_outdir))
-        for i, (text, var, cb) in enumerate(rows):
-            self.lab(g, text, fg=INK2, width=9, anchor="e").grid(
-                row=i, column=0, sticky="e", pady=4, padx=(0, 8))
-            ttk.Entry(g, textvariable=var).grid(row=i, column=1, sticky="we", pady=4)
-            ttk.Button(g, text="浏览…", command=cb).grid(row=i, column=2, padx=(8, 0))
-        self.lab(g, "输出文件名", fg=INK2, width=9, anchor="e").grid(
-            row=2, column=0, sticky="e", pady=4, padx=(0, 8))
-        name = tk.Frame(g, bg=CARD)
-        name.grid(row=2, column=1, sticky="we", pady=4)
-        ttk.Entry(name, textvariable=self.var_outname, width=24).pack(side="left")
-        self.lab(name, "相机按 DSC_#### 编号，别和卡上已有的重名", fg=INK3,
-                 font=F_SMALL).pack(side="left", padx=10)
-        self.lab(g, "").grid(row=2, column=2)
-        self.lbl_srcinfo = self.lab(b, "", fg=INK3, font=F_SMALL)
-        self.lbl_srcinfo.pack(fill="x", pady=(6, 0))
+        tv = ttk.Treeview(body, columns=("src", "out", "st"), show="headings",
+                          height=5, selectmode="extended", style="Cam.Treeview")
+        tv.heading("src", text="输入", anchor="w")
+        tv.heading("out", text="输出", anchor="w")
+        tv.heading("st", text="状态", anchor="w")
+        tv.column("src", width=430, anchor="w")
+        tv.column("out", width=160, anchor="w")
+        tv.column("st", width=150, anchor="w")
+        tv.pack(fill="both", expand=True)
+        tv.tag_configure("ok", foreground=OK)
+        tv.tag_configure("run", foreground=ACCENT)
+        tv.tag_configure("bad", foreground=DANGER)
+        self.tv = tv
 
-    # ②转换参数（普通/高级两套，切换显示）
-    def card_params(self):
-        outer, b = self.card(self.body, "② 转换参数")
-        outer.pack(fill="x", padx=14, pady=(10, 0))
-        self.adv_boxes = []
-        self.f_basic = tk.Frame(b, bg=CARD)
-        self.f_adv = tk.Frame(b, bg=CARD)
-        self.build_basic(self.f_basic)
-        self.build_adv(self.f_adv)
-        self.thumb_group(b)          # 缩略图两种模式共用
+        bar = tk.Frame(body, bg=CARD)
+        bar.pack(fill="x", pady=(8, 2))
+        self.btn_add = tk.Button(bar, text="添加文件…", command=self.add_files,
+                                 bg=LINE2, fg=INK, relief="flat", bd=0, font=F_SMALL,
+                                 padx=12, pady=5, cursor="hand2")
+        self.btn_add.pack(side="left")
+        for text, cb in (("移除", self.remove_sel), ("清空", self.clear_all)):
+            tk.Button(bar, text=text, command=cb, bg=CARD, fg=INK2, relief="flat",
+                      bd=0, font=F_SMALL, cursor="hand2").pack(side="left", padx=(10, 0))
+        self.lbl_count = tk.Label(bar, text="0 个", bg=CARD, fg=INK3, font=F_SMALL)
+        self.lbl_count.pack(side="left", padx=(12, 0))
 
-    def build_basic(self, f):
-        self.note(f, "普通模式只用真机验证过的配方：1920×1080 / H.265(x265) / "
-                     "PCM 24bit，与 Nikon Z5II 原生格式一致。",
-                  fg=INK2, pady=(0, 8))
-        g = tk.Frame(f, bg=CARD)
-        g.pack(fill="x")
-        g.columnconfigure(1, weight=1)
-        self.lab(g, "转换预设", fg=INK2, width=9, anchor="e").grid(
-            row=0, column=0, sticky="e", padx=(0, 8))
-        cb = ttk.Combobox(g, textvariable=self.var_preset, state="readonly",
-                          values=[p[0] for p in PRESETS])
-        cb.grid(row=0, column=1, sticky="we")
-        cb.bind("<<ComboboxSelected>>", self.on_preset)
-        self.lab(g, "输出帧率", fg=INK2, width=9, anchor="e").grid(
-            row=1, column=0, sticky="e", padx=(0, 8), pady=(6, 0))
-        fcb = ttk.Combobox(g, textvariable=self.var_fps, state="readonly",
-                           values=[c[0] for c in FPS_CHOICES])
-        fcb.grid(row=1, column=1, sticky="we", pady=(6, 0))
-        fcb.bind("<<ComboboxSelected>>", self.on_fps)
-        self.lab(g, "相机模板", fg=INK2, width=9, anchor="e").grid(
-            row=2, column=0, sticky="e", padx=(0, 8), pady=(6, 0))
-        tpl = tk.Frame(g, bg=CARD)
-        tpl.grid(row=2, column=1, sticky="we", pady=(6, 0))
-        ttk.Entry(tpl, textvariable=self.var_tpl).pack(side="left", fill="x",
-                                                       expand=True)
-        ttk.Button(tpl, text="换一个…", command=self.pick_tpl).pack(side="left",
-                                                                    padx=(8, 0))
-        self.note_basic_fps = self.note(f, "", fg=OK, pady=(8, 0))
-        self.note(f, "⚠ 码率决定体积与耗时：15 Mbps 与相机原生同档（默认）；"
-                     "5 Mbps 实测相机能播、体积约四成，编码也快一倍；"
-                     "40 Mbps 画质更好、更慢更大。", fg=WARN)
+        line = tk.Frame(body, bg=CARD)
+        line.pack(fill="x", pady=(4, 0))
+        tk.Label(line, text="保存到", bg=CARD, fg=INK3, font=F_SMALL).pack(side="left")
+        self.lbl_out = tk.Label(line, textvariable=self.var_outdir, bg=CARD, fg=INK2,
+                                font=F_SMALL, anchor="w")
+        self.lbl_out.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        tk.Button(line, text="更改", command=self.pick_outdir, bg=CARD, fg=ACCENT,
+                  relief="flat", bd=0, font=F_SMALL, cursor="hand2").pack(side="left")
 
-    def build_adv(self, f):
-        self.note(f, "每项可自定义；标「已锁定」的项会破坏相机兼容性，工具不开放。",
-                  fg=INK2, pady=(0, 8))
+    def card_quality(self):
+        outer = self.card("画质")
+        outer.pack(fill="x", padx=20, pady=(10, 0))
+        body = tk.Frame(outer, bg=CARD)
+        body.pack(fill="x", padx=16, pady=(2, 12))
 
-        def group(title):
-            self.rule(f)
-            self.lab(f, title, fg=INK3, font=F_SMALL).pack(fill="x", pady=(0, 4))
-            g = tk.Frame(f, bg=CARD)
-            g.pack(fill="x")
-            g.columnconfigure(0, minsize=142)   # 用列宽而不是 Label 的 width，
-            g.columnconfigure(1, weight=1)      # 否则长标签会被裁掉半截
-            g.columnconfigure(2, minsize=146)
-            g.columnconfigure(3, weight=1)
-            return g
+        self.lb = tk.Listbox(body, height=3, activestyle="none", bd=0,
+                             highlightthickness=1, highlightbackground=LINE,
+                             selectbackground=ACCENT_SOFT, selectforeground=INK,
+                             bg=CARD, fg=INK, font=F_BODY, exportselection=False)
+        for name, _r, _p, tip in QUALITY:
+            self.lb.insert("end", f"  {name}    {tip}")
+        self.lb.pack(fill="x")
+        self.lb.selection_set(1)
+        self.lb.bind("<<ListboxSelect>>", self.on_quality)
 
-        def row(g, r, c0, c1, c2, c3):
-            """一行两个字段：左标签/控件 + 右标签/控件。"""
-            self.lab(g, c0, fg=INK2, anchor="e").grid(
-                row=r, column=0, sticky="e", padx=(0, 8), pady=4)
-            c1.grid(row=r, column=1, sticky="we", pady=4, padx=(0, 18))
-            self.lab(g, c2, fg=INK2, anchor="e").grid(
-                row=r, column=2, sticky="e", padx=(0, 8), pady=4)
-            c3.grid(row=r, column=3, sticky="we", pady=4)
+        row = tk.Frame(body, bg=CARD)
+        row.pack(fill="x", pady=(8, 0))
+        tk.Checkbutton(row, text="转换完自动校验（43 项门禁）",
+                       variable=self.var_verify, bg=CARD, fg=INK2, font=F_SMALL,
+                       activebackground=CARD, selectcolor=CARD,
+                       highlightthickness=0, cursor="hand2").pack(side="left")
+        self.btn_more = tk.Button(row, text="更多选项 ▾", command=self.toggle_more,
+                                  bg=CARD, fg=ACCENT, relief="flat", bd=0,
+                                  font=F_SMALL, cursor="hand2")
+        self.btn_more.pack(side="right")
 
-        # 画面
-        g = group("画面")
-        fcb = ttk.Combobox(g, textvariable=self.var_fps, state="readonly",
-                           values=[c[0] for c in FPS_CHOICES])
-        fcb.bind("<<ComboboxSelected>>", self.on_fps)
-        row(g, 0, "分辨率 --size",
-            ttk.Combobox(g, textvariable=self.var_size, state="readonly",
-                         values=["1920x1080"]),
-            "输出帧率 --fps", fcb)
-        self.rule(f)
-        self.note(f, "分辨率与帧率都按相机 1080p 原生规格；4K 要配 4K 模板"
-                     "（本版不开放）。")
-        self.note_adv_fps = self.note(f, "", fg=OK)
-        g2 = tk.Frame(f, bg=CARD)
-        g2.pack(fill="x")
-        g2.columnconfigure(0, minsize=142)
-        g2.columnconfigure(1, weight=1)
-        self.lab(g2, "码率 --bitrate", fg=INK2, anchor="e").grid(
-            row=0, column=0, sticky="e", padx=(0, 8), pady=4)
-        ttk.Combobox(g2, textvariable=self.var_bitrate,
-                     values=["5M", "15M", "40M"]).grid(row=0, column=1, sticky="w",
-                                                       pady=4)
-        self.lab(g2, "CBR 近似；15M 与相机原生同档、5M 实测相机能播（体积约四成），"
-                     "也可以自己填（如 20M）",
-                 fg=INK3, font=F_SMALL).grid(row=0, column=2, sticky="w", padx=8)
-
-        # 编码
-        g = group("编码")
-        row(g, 0, "x265 预设 --preset",
-            ttk.Combobox(g, textvariable=self.var_xpreset,
-                         values=["fast", "medium", "faster", "veryfast"]),
-            "编码器 --encoder", self.locked(g, "x265（已锁定）"))
-        self.note(f, "GPU(NVENC) 给的是 CTU 32 + TU 深度 3，与相机差得远，"
-                     "会产出相机不认的文件。", fg=WARN)
-        g = tk.Frame(f, bg=CARD)
-        g.pack(fill="x")
-        g.columnconfigure(1, weight=1)
-        g.columnconfigure(3, weight=1)
-        self.lab(g, "并行段数 --jobs", fg=INK2, anchor="e").grid(
-            row=0, column=0, sticky="e", padx=(0, 8), pady=4)
-        self.locked(g, "自动 · GOP 对齐 v2（真机验证）").grid(
-            row=0, column=1, sticky="we", pady=4, padx=(0, 18))
-        self.lab(g, "mdat 块 --mdat", fg=INK2, anchor="e").grid(
-            row=0, column=2, sticky="e", padx=(0, 8), pady=4)
-        self.locked(g, "655360（沿用模板）").grid(row=0, column=3, sticky="we", pady=4)
-        self.note(f, "并行段数按源自动（时长 ≥25 s 才分段：59.94→4 段、29.97→6 段，"
-                     "段首 IDR 与单进程同位）；6 段并行的 DSC_8965 / DSC_9700 已真机"
-                     "播放通过。mdat 按 0.5 秒分块，是相机的要求。", fg=INK2)
-
-        # 截取
-        g = group("截取")
-        row(g, 0, "起始 --start",
-            ttk.Entry(g, textvariable=self.var_start, width=10),
-            "时长 --duration",
-            ttk.Entry(g, textvariable=self.var_dur, width=10))
-        self.note(f, "⚠ 截取出来的短文件（<1 分钟）在相机上快进越界时不会被夹紧；"
-                     "全长文件正常。发布测试版不推荐截取。", fg=WARN)
-
-        # 音频与元数据
-        g = group("音频与元数据")
-        row(g, 0, "", ttk.Checkbutton(g, text="不带音频 --no-audio",
-                                      variable=self.var_noaudio),
-            "拍摄时间 --time",
-            ttk.Combobox(g, textvariable=self.var_time, state="readonly",
-                         values=["now", "keep"]))
-        row(g, 1, "", ttk.Checkbutton(g, text="不重建缩略图 --no-thumbs",
-                                      variable=self.var_nothumbs),
-            "", ttk.Checkbutton(g, text="保留中间文件 --keep",
-                                variable=self.var_keep))
-
-        # 模板
-        self.rule(f)
-        gt = tk.Frame(f, bg=CARD)
-        gt.pack(fill="x")
-        gt.columnconfigure(0, minsize=142)
-        gt.columnconfigure(1, weight=1)
-        self.lab(gt, "模板 MOV --template", fg=INK2, anchor="e").grid(
-            row=0, column=0, sticky="e", padx=(0, 8))
-        ttk.Entry(gt, textvariable=self.var_tpl).grid(row=0, column=1, sticky="we")
-        ttk.Button(gt, text="浏览…", command=self.pick_tpl).grid(row=0, column=2,
-                                                                 padx=(8, 0))
-        ttk.Button(gt, text="恢复默认", command=self.reset_tpl).grid(row=0, column=3,
-                                                                     padx=(6, 0))
-        self.note(f, "必须用相机自己录的同规格 MOV 当模板：容器结构、时间基、"
-                     "缩略图都照抄它。随包两个相机原片：59.94 输出配 "
-                     "templates\\DSC_8955.MOV、29.97 输出配 templates\\DSC_8960.MOV"
-                     "（选帧率时自动切换）。tkhd 时长为可播放长度，由工具按模板"
-                     "写入，不提供修改项（改了这个相机快进越界会卡死）。",
-                  pady=(4, 0))
-
-    def thumb_group(self, parent):
-        """缩略图：普通/高级模式共用的一个块。"""
-        g = tk.Frame(parent, bg=CARD)
-        g.pack(fill="x", pady=(10, 0))
-        self.thumb_block = g      # 普通/高级参数块要 pack 在它前面
-        self.rule(g)
-        head = tk.Frame(g, bg=CARD)
-        head.pack(fill="x", pady=(0, 6))
-        self.lab(head, "缩略图", fg=INK).pack(side="left")
-        self.lab(head, "相机播放列表和全屏预览里显示的画面", fg=INK3,
-                 font=F_SMALL).pack(side="left", padx=8)
-        rowf = tk.Frame(g, bg=CARD)
-        rowf.pack(fill="x")
-        prev = tk.Frame(rowf, bg=BOX, width=192, height=108)
-        prev.pack(side="left")
-        prev.pack_propagate(False)
-        self.prev_img = tk.Label(prev, text="取帧预览", bg=BOX, fg=INK3, font=F_SMALL)
-        self.prev_img.pack(fill="both", expand=True)
-        right = tk.Frame(rowf, bg=CARD)
-        right.pack(side="left", fill="x", expand=True, padx=(12, 0))
-        seg = tk.Frame(right, bg=CARD)
-        seg.pack(fill="x")
-        for text, val in (("首帧（默认）", "first"), ("指定时间", "time"),
-                          ("图片文件", "file")):
-            tk.Radiobutton(seg, text=text, value=val, variable=self.var_thumb_mode,
-                           indicatoron=0, command=self.thumb_mode, bg=LINE2, fg=INK,
-                           selectcolor=ACCENT_SOFT, activebackground=ACCENT_SOFT,
-                           relief="flat", bd=0, padx=10, pady=4, font=F_BODY,
-                           highlightthickness=1, highlightbackground=LINE,
-                           cursor="hand2").pack(side="left", padx=(0, 4))
-        self.thumb_rows = {}
-        r1 = tk.Frame(right, bg=CARD)
-        sc = tk.Scale(r1, variable=self.var_thumb_sec, from_=0, to=600, resolution=0.5,
-                      orient="horizontal", showvalue=0, bg=CARD, highlightthickness=0,
-                      troughcolor=LINE2, activebackground=ACCENT, sliderrelief="flat",
-                      length=220)
-        sc.pack(side="left")
-        self.var_thumb_sec.trace_add("write", lambda *_: self.thumb_cap())
-        ttk.Button(r1, text="取这一帧", command=self.make_preview).pack(side="left",
-                                                                        padx=8)
-        self.thumb_rows["time"] = r1
-        r2 = tk.Frame(right, bg=CARD)
-        ttk.Entry(r2, textvariable=self.var_thumb_img).pack(side="left", fill="x",
-                                                            expand=True)
-        ttk.Button(r2, text="浏览…", command=self.pick_thumb_img).pack(side="left",
-                                                                       padx=8)
-        self.thumb_rows["file"] = r2
-        self.thumb_rows["first"] = tk.Frame(right, bg=CARD)
-        self.lab(self.thumb_rows["first"], "取视频第一帧（有截取时取截取起点）—— "
-                 "和相机原生行为一致，最稳", fg=INK2, font=F_SMALL).pack(side="left")
-        self.prev_cap = self.lab(g, "", fg=INK3, font=F_SMALL)
-        self.prev_cap.pack(fill="x", pady=(6, 0))
-        self.var_thumb_mode.trace_add("write", lambda *_: self.thumb_cap())
-
-    # 操作
-    def card_actions(self, parent=None):
-        outer, b = self.card(parent or self.body, "操作")
-        outer.pack(fill="x", padx=14, pady=(8, 0))
-        self.btn_go = ttk.Button(b, text="① 开始转换", style="Primary.TButton",
-                                 command=self.run_convert)
-        self.btn_go.pack(side="left")
-        self.btn_cancel = ttk.Button(b, text="取消转换", command=self.cancel_job)
-        self.btn_ver = ttk.Button(b, text="② 校验门禁", command=self.run_verify)
-        self.btn_ver.pack(side="left", padx=6)
-        self.btn_copy = ttk.Button(b, text="③ 拷到卡上", command=self.run_copy)
-        self.btn_copy.pack(side="left")
-        ttk.Button(b, text="打开输出目录", command=self.open_out).pack(side="right")
-
-    # 进度与预计时间
-    def card_progress(self, parent=None):
-        outer, b = self.card(parent or self.body, "进度与预计时间",
-                             "剩余时间按编码速度实时估算")
-        outer.pack(fill="x", padx=14, pady=(8, 0))
-        head = tk.Frame(b, bg=CARD)
-        head.pack(fill="x")
-        self.badge = tk.Label(head, text="空闲", bg=LINE2, fg=INK2, font=F_SMALL,
-                              padx=8, pady=2)
-        self.badge.pack(side="left")
-        self.lbl_stage = self.lab(head, "等待开始", fg=INK2)
-        self.lbl_stage.pack(side="left", padx=10)
-        self.lbl_pct = self.lab(head, "", fg=INK, font=F_BIG, anchor="e")
-        self.lbl_pct.pack(side="right")
-        self.bar = ttk.Progressbar(b, style="Cam.Horizontal.TProgressbar",
-                                   maximum=100.0)
-        self.bar.pack(fill="x", pady=(8, 4))
-        self.stats = tk.Frame(b, bg=CARD)
-        self.stat_lbls = {}
-        for i, key in enumerate(("已用时间", "预计剩余", "编码速度", "已处理 / 总时长",
-                                 "输出大小")):
-            cell = tk.Frame(self.stats, bg=CARD)
-            cell.grid(row=0, column=i, sticky="w", padx=(0, 26))
-            self.lab(cell, key, fg=INK3, font=F_SMALL).pack(anchor="w")
-            v = self.lab(cell, "—", fg=INK)
-            v.pack(anchor="w")
-            self.stat_lbls[key] = v
-
-    # 日志
     def card_log(self):
-        outer, b = self.card(self.body, "日志")
-        outer.pack(fill="x", padx=14, pady=(10, 12))
-        bar = tk.Frame(b, bg=CARD)
-        bar.pack(fill="x")
-        for text, cb in (("清空", self.log_clear), ("复制", self.log_copy),
-                         ("保存…", self.log_save)):
-            ttk.Button(bar, text=text, command=cb).pack(side="right", padx=(6, 0))
-        box = tk.Frame(b, bg=LOG_BG)
-        box.pack(fill="both", expand=True, pady=(6, 0))
-        self.log = tk.Text(box, height=9, wrap="word", bg=LOG_BG, fg=LOG_INK,
-                           insertbackground=LOG_INK, font=F_MONO, relief="flat",
-                           padx=8, pady=6)
-        sb = ttk.Scrollbar(box, command=self.log.yview)
-        self.log.configure(yscrollcommand=sb.set, state="disabled")
-        sb.pack(side="right", fill="y")
-        self.log.pack(side="left", fill="both", expand=True)
-        self.log.tag_configure("dim", foreground=LOG_DIM)
-        self.log.tag_configure("ok", foreground=LOG_OK)
-        self.log.tag_configure("bad", foreground=LOG_BAD)
-        self.log.tag_configure("warn", foreground=LOG_WARN)
-        self.log_write("[就绪] 选好输入文件与输出目录，点「① 开始转换」。")
-        self.log_write("[提示] 4 分钟视频约需 20 分钟（15-12450H），编码占 97%，"
-                       "进度不会走得很快。")
-        self.log_write("[提示] 转换完成后会自动跑 43 项门禁，43/43 通过才建议拷到卡上。")
+        self.btn_log = tk.Button(self.log_head, text="日志 ▾", command=self.toggle_log,
+                                 bg=BG, fg=INK3, relief="flat", bd=0, font=F_SMALL,
+                                 cursor="hand2", anchor="w")
+        self.btn_log.pack(side="left", pady=(0, 2))
+        self.log_box = tk.Frame(self.root, bg=LOG_BG)
+        self.log = tk.Text(self.log_box, height=8, bg=LOG_BG, fg=LOG_INK, bd=0,
+                           font=F_MONO, wrap="none", padx=10, pady=8,
+                           state="disabled")
+        self.log.pack(fill="both", expand=True)
+        for tag, fg in (("ok", LOG_OK), ("bad", LOG_BAD), ("warn", LOG_WARN),
+                        ("dim", LOG_DIM)):
+            self.log.tag_configure(tag, foreground=fg)
 
-    def statusbar(self):
-        bar = tk.Frame(self.root, bg=BG)
-        bar.pack(side="bottom", fill="x", padx=14, pady=(6, 8))
-        self.lbl_status = self.lab(bar, "空闲", fg=INK3, font=F_SMALL, bg=BG)
-        self.lbl_status.pack(side="left")
-        self.lbl_tpl = self.lab(bar, "", fg=INK3, font=F_SMALL, bg=BG)
-        self.lbl_tpl.pack(side="right")
-        self.sync_status()
-        self.var_tpl.trace_add("write", lambda *_: self.sync_status())
+    def card_bottom(self):
+        self.bar = ttk.Progressbar(self.bottom, mode="determinate", maximum=100,
+                                   style="Cam.Horizontal.TProgressbar")
+        self.bar.pack(fill="x", pady=(0, 8))
+        row = tk.Frame(self.bottom, bg=BG)
+        row.pack(fill="x")
+        self.lbl_state = tk.Label(row, text="", bg=BG, fg=INK2, font=F_BODY)
+        self.lbl_state.pack(side="left")
+        self.f_post = tk.Frame(row, bg=BG)
+        self.btn_run = ttk.Button(row, text="开始转换", style="Primary.TButton",
+                                  command=self.toggle_run)
+        self.btn_run.pack(side="right")
+        self.btn_cancel = tk.Button(row, text="取消", command=self.cancel_job,
+                                    bg=DANGER, fg="white", activebackground=DANGER,
+                                    activeforeground="white", relief="flat", bd=0,
+                                    font=F_TITLE, padx=16, pady=7, cursor="hand2")
 
-    def sync_status(self):
-        """右下那行：门禁状态 + 输出帧率 + 当前模板 + 版本。门禁过了要显示出来。"""
-        self.lbl_tpl.configure(
-            text=("门禁 43/43 通过 · " if self.gate_ok else "门禁未运行 · ")
-            + f"输出 {self.fps_text()} · 模板 {Path(self.var_tpl.get()).name} · "
-            + APP_VERSION)
+    def card(self, title):
+        outer = tk.Frame(self.root, bg=CARD, highlightbackground=LINE,
+                         highlightthickness=1)
+        head = tk.Frame(outer, bg=CARD)
+        head.pack(fill="x", padx=16, pady=(10, 2))
+        tk.Label(head, text=title, bg=CARD, fg=INK3, font=F_SMALL).pack(side="left")
+        return outer
 
-    # ---------- 模式 / 缩略图 ----------
-    def apply_mode(self):
-        adv = self.var_mode.get() == "adv"
-        # 缩略图块是两种模式共用的，必须在它前面 pack，否则会被挤到后面去
-        if adv:
-            self.f_basic.pack_forget()
-            self.f_adv.pack(fill="x", before=self.thumb_block)
-        else:
-            self.f_adv.pack_forget()
-            self.f_basic.pack(fill="x", before=self.thumb_block)
-            self.sync_preset_label()
-        self.thumb_mode()
-
-    def sync_preset_label(self):
-        cur = (self.var_bitrate.get().strip(), self.var_xpreset.get().strip())
-        for label, br, pr in PRESETS:
-            if (br, pr) == cur:
-                self.var_preset.set(label)
-                return
-        self.var_preset.set(f"自定义 · {cur[0]} / {cur[1]}（在高级模式改的）")
-
-    def on_preset(self, _e=None):
-        for label, br, pr in PRESETS:
-            if label == self.var_preset.get():
-                self.var_bitrate.set(br)
-                self.var_xpreset.set(pr)
-
-    # ---------- 输出帧率 / 模板配套 ----------
-    @staticmethod
-    def fps_key_of(label):
-        for text, key in FPS_CHOICES:
-            if text == label:
-                return key
-        return ""
-
-    def fps_key(self):
-        """用户选的输出帧率模式："" = 59.94 原生，或 "source" = 跟随源。"""
-        return self.fps_key_of(self.var_fps.get())
-
-    def src_fps(self):
-        fr = (self.src_probe or {}).get("r_frame_rate", "") or ""
-        try:
-            n, d = (float(x) for x in fr.split("/"))
-            return n / d if d else 0.0
-        except Exception:
-            return 0.0
-
-    def fps_eff(self):
-        """实际生效的帧率模式：「跟随源」只对真 30fps/29.97 的源有效。"""
-        f = self.src_fps()
-        if self.fps_key() == "source" and 29.5 <= f <= 30.5:
-            return "source"
-        return ""
-
-    def fps_text(self):
-        return "29.97（跟随源）" if self.fps_eff() == "source" else "59.94"
-
-    def tpl_default(self, key=None):
-        return RES / "templates" / BUNDLED_TPLS[
-            self.fps_eff() if key is None else key]
-
-    def is_bundled_tpl(self):
-        name = Path(self.var_tpl.get().strip() or ".").name
-        return name in tuple(BUNDLED_TPLS.values())
-
-    def reset_tpl(self):
-        self.var_tpl.set(str(self.tpl_default()))
-
-    def on_fps(self, _e=None):
-        self.sync_tpl_for_fps()
-        self.refresh_fps_notes()
-
-    def sync_tpl_for_fps(self):
-        """选 29.97 就把随包的 59.94 模板换成 30fps 那个（只动随包模板，
-        用户自己挑的模板不碰）。"""
-        want = str(self.tpl_default())
-        if self.is_bundled_tpl() and self.var_tpl.get().strip() != want:
-            self.var_tpl.set(want)
-
-    def refresh_fps_notes(self):
-        key = self.fps_eff()
-        if key == "source":
-            txt = ("✓ 跟随源：输出 1920×1080 / 29.97fps（源就是 30fps），与相机 "
-                   "30p 模式同规格；43/43 门禁与真机播放都已验证（DSC_9700）。"
-                   "不补帧，编码时间与体积都约为 59.94 的一半。")
-            fg = OK
-        elif self.fps_key() == "source":
-            txt = (f"⚠ 源不是 30fps（{self.src_fps():.2f}fps）：「跟随源」只对 "
-                   "30fps/29.97 源生效，本次已按 59.94 输出（相机原生）。")
-            fg = WARN
-        else:
-            txt = ("✓ 输出固定为 1920×1080 / 59.94fps / H.265(x265) / PCM 24bit，"
-                   "与 Nikon Z5II 原生格式一致。源是 30fps 时会被补帧到 59.94，"
-                   "时间翻倍 —— 想省一半时间就选「跟随源」。")
-            fg = OK
-        for lb in (getattr(self, "note_basic_fps", None),
-                   getattr(self, "note_adv_fps", None)):
-            if lb is not None:
-                lb.configure(text=txt, fg=fg)
-        self.sync_tpl_for_fps()
-
-    def thumb_mode(self):
-        mode = self.var_thumb_mode.get()
-        for key, w in self.thumb_rows.items():
-            if key == mode:
-                w.pack(fill="x", pady=(6, 0))
-            else:
-                w.pack_forget()
-        self.thumb_cap()
-
-    def thumb_cap(self):
-        mode = self.var_thumb_mode.get()
-        if mode == "file":
-            txt = "用指定图片；工具会按 3 种尺寸缩放后编成相机规格 JPEG"
-        else:
-            secs = self.var_thumb_sec.get() if mode == "time" else 0.0
-            txt = (f"取第 {int(secs) // 60:02d}:{secs % 60:04.1f} 帧 · "
-                   "160×120（NCTH）/ 640×360（NCM1）/ 1920×1080（NCVW）"
-                   if mode == "time" else
-                   "取首帧 · 160×120（NCTH）/ 640×360（NCM1）/ 1920×1080（NCVW）")
-        self.prev_cap.configure(text=txt)
-
-    # ---------- 选文件 ----------
-    def pick_src(self):
-        p = filedialog.askopenfilename(
-            title="选择要转换的视频",
-            filetypes=[("视频", "*.mp4 *.mov *.mkv *.avi *.m4s *.flv *.webm *.ts"),
-                       ("所有文件", "*.*")])
-        if not p:
+    # ---------- 更多选项 ----------
+    def toggle_more(self):
+        if self.var_more.get():
+            self.more_panel.pack_forget()
+            self.var_more.set(False)
+            self.btn_more.configure(text="更多选项 ▾")
             return
-        self.var_src.set(p)
-        if not self.var_outdir.get().strip():
-            self.var_outdir.set(str(Path(p).parent))
-        self.probe_src()
-        self.make_preview()
+        self.var_more.set(True)
+        self.btn_more.configure(text="更多选项 ▴")
+        for w in self.more_panel.winfo_children():
+            w.destroy()
+        body = tk.Frame(self.more_panel, bg=CARD)
+        body.pack(fill="x", padx=16, pady=12)
+
+        def row(label, factory):
+            r = tk.Frame(body, bg=CARD)
+            r.pack(fill="x", pady=(0, 8))
+            tk.Label(r, text=label, bg=CARD, fg=INK3, font=F_SMALL, width=6,
+                     anchor="e").pack(side="left")
+            w = factory(r)
+            w.pack(side="left", padx=(8, 0))
+            return w
+
+        self.cb_tpl = row("模板", lambda f: ttk.Combobox(
+            f, textvariable=self.var_tpl, state="readonly", width=30,
+            values=["自动"] + [f"随包 {v}" for v in BUNDLED_TPLS.values()]
+            + ["选择文件…"]))
+        self.cb_tpl.bind("<<ComboboxSelected>>", self.on_tpl_choice)
+        self.cb_thumb = row("封面", lambda f: ttk.Combobox(
+            f, textvariable=self.var_thumb, state="readonly", width=30,
+            values=["自动", "首帧", "末尾一帧", "选择图片…"]))
+        self.cb_thumb.bind("<<ComboboxSelected>>", self.on_thumb_choice)
+        row("分段", lambda f: ttk.Spinbox(f, from_=1, to=50, width=5,
+                                          textvariable=self.var_pieces))
+        tk.Label(body, text="分段 = 长片切成几段再转（切点对齐关键帧），1 = 不切",
+                 bg=CARD, fg=INK3, font=F_SMALL).pack(anchor="w")
+        self.more_panel.pack(fill="x", padx=20, pady=(10, 0), before=self.log_head)
+
+    def on_tpl_choice(self, _e=None):
+        if self.var_tpl.get() == "选择文件…":
+            p = filedialog.askopenfilename(
+                title="选择相机模板 MOV（同分辨率的相机原片）",
+                filetypes=[("MOV", "*.MOV *.mov"), ("所有文件", "*.*")])
+            if p:
+                self.tpl_path = p
+                self.var_tpl.set(f"自定义 {Path(p).name}")
+            else:
+                self.var_tpl.set("自动")
+
+    def on_thumb_choice(self, _e=None):
+        if self.var_thumb.get() == "选择图片…":
+            p = filedialog.askopenfilename(
+                title="选择图片当封面",
+                filetypes=[("图片", "*.jpg *.jpeg *.png *.bmp *.webp")])
+            if p:
+                self.thumb_path = p
+                self.var_thumb.set(f"自定义 {Path(p).name}")
+            else:
+                self.var_thumb.set("自动")
+
+    def toggle_log(self):
+        if self.var_log.get():
+            self.log_box.pack_forget()
+            self.var_log.set(False)
+            self.btn_log.configure(text="日志 ▾")
+        else:
+            self.var_log.set(True)
+            self.btn_log.configure(text="日志 ▴")
+            self.log_box.pack(side="bottom", fill="both", expand=True,
+                              padx=20, pady=(0, 8))
+
+    # ---------- 队列 ----------
+    def set_mode(self, key):
+        if self.busy:
+            return
+        self.mode = key
+        for k, b in self.tab_btns.items():
+            on = k == key
+            b.configure(bg=ACCENT_SOFT if on else CARD,
+                        fg=ACCENT if on else INK3,
+                        activebackground=ACCENT_SOFT)
+        self.btn_add.configure(text="添加视频…" if key == "pick" else "添加分片…")
+
+    def next_name(self):
+        d = self.out_dir()
+        while True:
+            self.seq += 1
+            name = f"DSC_{self.seq:04d}.MOV"
+            if not (d / name).exists():
+                return name
+
+    def out_dir(self):
+        return Path(self.var_outdir.get().strip() or ".")
+
+    def scan_seq(self):
+        d = self.out_dir()
+        best = 0
+        if d.is_dir():
+            for f in d.glob("DSC_*.MOV"):
+                try:
+                    best = max(best, int(f.stem.split("_")[1]))
+                except Exception:
+                    pass
+        self.seq = best
+
+    def add_paths(self, paths, audio=None):
+        if not paths:
+            return
+        if not self.seq:
+            self.scan_seq()
+        for p in paths:
+            p = Path(p)
+            item = {"src": p, "audio": audio, "out": self.next_name(),
+                    "iid": None, "status": "排队", "kind": "video"}
+            self.items.append(item)
+            item["iid"] = self.tv.insert(
+                "", "end", values=(p.name, item["out"], "排队"), tags=("",))
+        self.refresh_list()
+        self.log_write(f"加入 {len(paths)} 个文件")
+
+    def add_files(self):
+        if self.mode == "pick":
+            paths = filedialog.askopenfilenames(
+                title="选择视频", filetypes=[("视频", VIDEO_EXT),
+                                            ("所有文件", "*.*")])
+            self.add_paths(paths)
+        else:
+            p = filedialog.askopenfilename(
+                title="选择视频分片（音频会自动配对）",
+                filetypes=[("分片", "*.m4s"), ("所有文件", "*.*")])
+            if not p:
+                return
+            p = Path(p)
+            audio = None
+            for a, b in AUDIO_PAIRS:
+                if a in p.name:
+                    cand = p.with_name(p.name.replace(a, b))
+                    if cand.exists():
+                        audio = cand
+                    break
+            if audio:
+                self.log_write(f"配对音频：{audio.name}")
+            else:
+                self.log_write("没找到配对音频，按单个文件处理")
+            self.add_paths([p], audio=audio)
+
+    def remove_sel(self):
+        if self.busy:
+            return
+        for iid in self.tv.selection():
+            self.items = [it for it in self.items if it["iid"] != iid]
+            self.tv.delete(iid)
+        self.refresh_list()
+
+    def clear_all(self):
+        if self.busy:
+            return
+        for iid in self.tv.get_children():
+            self.tv.delete(iid)
+        self.items = []
+        self.seq = 0
+        self.refresh_list()
+
+    def refresh_list(self):
+        n = len(self.items)
+        self.lbl_count.configure(text=f"{n} 个")
+        if not self.busy:
+            self.btn_run.configure(state="normal" if n else "disabled")
+            self.lbl_state.configure(
+                text=f"{n} 个待转换" if n else "添加视频后开始",
+                fg=INK2 if n else INK3)
 
     def pick_outdir(self):
         p = filedialog.askdirectory(title="选择输出目录")
         if p:
             self.var_outdir.set(p)
+            self.seq = 0
 
-    def pick_tpl(self):
-        p = filedialog.askopenfilename(
-            title="选择相机模板 MOV（同分辨率的相机原片）",
-            filetypes=[("MOV", "*.MOV *.mov"), ("所有文件", "*.*")])
-        if p:
-            self.var_tpl.set(p)
+    def on_quality(self, _e=None):
+        sel = self.lb.curselection()
+        if sel:
+            self.var_quality.set(sel[0])
 
-    def pick_thumb_img(self):
-        p = filedialog.askopenfilename(
-            title="选择一张图片当缩略图",
-            filetypes=[("图片", "*.jpg *.jpeg *.png *.bmp *.webp"),
-                       ("所有文件", "*.*")])
-        if p:
-            self.var_thumb_img.set(p)
+    # ---------- 跑 ----------
+    def quality(self):
+        return QUALITY[self.var_quality.get()]
 
-    # ---------- 源信息 / 预览 ----------
-    def probe_src(self):
-        """跑一次 ffprobe 拿分辨率/帧率/时长/有无音频，填那一行"源 → 输出"。"""
-        src = self.var_src.get().strip()
+    def toggle_run(self):
+        self.cancel_job() if self.busy else self.run_queue()
 
-        def job():
-            info = self.probe_info(src)
-            if not info:
-                return
-            self.root.after(0, self.show_srcinfo, info)
-
-        threading.Thread(target=job, daemon=True).start()
-
-    @staticmethod
-    def probe_info(src):
-        """同步探一次（冒烟测试要当场判定帧率，不能等线程）。
-
-        用 JSON 而不是 `default=nw=1` 的平铺输出：平铺时每个流都打一遍同样的键，
-        dict 会被**音频流覆盖**（`r_frame_rate=0/0`），害得"跟随源"永远判不出 30fps
-        （2026-10-07 冒烟抓到的问题）。
-        """
-        info = {}
-        try:
-            r = subprocess.run(
-                [ffbin("ffprobe"), "-v", "error", "-print_format", "json",
-                 "-show_format", "-show_streams", src],
-                capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=60)
-            j = json.loads(r.stdout or "{}")
-        except Exception:
-            return {}
-        streams = j.get("streams") or []
-        vid = next((s for s in streams if s.get("codec_type") == "video"), {})
-        for k in ("width", "height", "r_frame_rate"):
-            if vid.get(k) is not None:
-                info[k] = str(vid[k])
-        info["duration"] = str((j.get("format") or {}).get("duration") or "")
-        info["codec_type"] = "video" if vid else ""
-        info["has_audio"] = "1" if any(s.get("codec_type") == "audio"
-                                       for s in streams) else ""
-        return info
-
-    def show_srcinfo(self, i):
-        if not i:
+    def run_queue(self):
+        if not self.items:
             return
-        self.src_probe = dict(i)
+        if self.tools.get("conv") is None:
+            return messagebox.showerror("错误", "转换模块没加载成功")
+        self.queue = list(self.items)
+        self.qi = 0
+        self.fail = 0
+        self.t_start = time.time()
+        self.busy = True
+        self.cancel_asked = False
+        self.bar.configure(value=0)
+        CANCEL_FLAG.unlink(missing_ok=True)
+        self.btn_run.configure(state="disabled")
+        self.btn_cancel.pack(side="right", padx=(0, 8))
+        self.f_post.pack_forget()
+        self.set_state("run")
+        self.log_write(f"开始：{len(self.queue)} 个 · {self.quality()[0]}")
+        self.next_item()
+
+    def next_item(self):
+        if self.cancel_asked or self.qi >= len(self.queue):
+            return self.finish_queue()
+        self.cur_item = self.queue[self.qi]
+        item = self.cur_item
+        self.enc_pct = None
+        self.gate_ok = False
+        self.done_file = None
+        item["status"] = "转换中"
+        self.tv.item(item["iid"], tags=("run",))
+        self.tv.set(item["iid"], "st", "准备中")
+        self.tv.see(item["iid"])
+        self.lbl_state.configure(
+            text=f"{self.qi + 1}/{len(self.queue)} · {item['src'].name}", fg=INK2)
+        threading.Thread(target=self.prepare_item, args=(item,),
+                         daemon=True).start()
+
+    def prepare_item(self, item):
+        """合并（如果需要）→ 定模板/帧率/封面 → 起转换线程。"""
         try:
-            w, h = i.get("width"), i.get("height")
-            fr = i.get("r_frame_rate", "")
-            fps = ""
-            if "/" in fr:
-                n, d = (float(x) for x in fr.split("/"))
-                if d:
-                    fps = f"{n / d:.2f}fps"
-            dur = float(i.get("duration") or 0) or None
-            audio = "含音频" if self.has_audio(i) else "无音频"
-            est = ""
-            if dur:
-                f = 6 if self.var_xpreset.get() in ("fast", "faster", "veryfast") else 15
-                if self.fps_eff() == "source":
-                    f /= 2         # 不补帧，帧数只有一半
-                est = f" · 预计转换约 {max(1, round(dur * f / 60))} 分钟（粗估）"
-            out_fps = ("29.97fps（跟随源）" if self.fps_eff() == "source"
-                       else "59.94fps")
-            self.var_srcinfo.set(
-                f"源 {w}×{h} · {fps} · {fmt_secs(dur)} · {audio}   →   "
-                f"输出 1920×1080 · {out_fps} · H.265(x265) / PCM 24bit{est}")
+            src = item["src"]
+            if item.get("audio"):
+                merged = src.with_name(src.stem.split("-")[0] + "_完整.mp4")
+                if not merged.exists():
+                    self.root.after(0, self.log_write, f"合并音视频 → {merged.name}")
+                    cmd = [ffbin("ffmpeg"), "-y", "-v", "error", "-i", str(src),
+                           "-i", str(item["audio"]), "-map", "0:v:0", "-map", "1:a:0",
+                           "-c", "copy", "-movflags", "+faststart", str(merged)]
+                    r = subprocess.run(cmd, capture_output=True, timeout=3600)
+                    if r.returncode or not merged.exists():
+                        raise RuntimeError("合并失败：" + r.stderr.decode(
+                            "utf-8", "replace")[-300:])
+                src = merged
+            info = probe_info(src)
+            fps = src_fps(info)
+            follow = 29.5 <= fps <= 30.5
+            tpl = self.pick_tpl(follow)
+            thumb = self.pick_thumb(src)
+            argv = self.build_argv(src, item["out"], tpl, follow, thumb)
+            self.root.after(0, self.start_item, item, argv)
         except Exception:
-            pass
-        self.refresh_fps_notes()
+            msg = traceback.format_exc()
+            self.root.after(0, self.log_write, "[异常]\n" + msg)
+            self.root.after(0, self.item_done, item, 1)
 
-    @staticmethod
-    def has_audio(i):
-        return bool(i.get("has_audio")) or i.get("codec_type") == "audio"
+    def pick_tpl(self, follow):
+        want = self.var_tpl.get()
+        if want.startswith("自定义") and self.tpl_path:
+            return self.tpl_path
+        if want.startswith("随包"):
+            for name in BUNDLED_TPLS.values():
+                if name in want:
+                    return str(RES / "templates" / name)
+        key = "29.97" if follow else "59.94"
+        return str(RES / "templates" / BUNDLED_TPLS[key])
 
-    def make_preview(self):
-        """抽一帧给界面看（跟输出无关，纯粹是"我要的是不是这一帧"）。"""
-        src = self.var_src.get().strip()
-        if not src or not Path(src).exists():
+    def pick_thumb(self, src):
+        mode = self.var_thumb.get()
+        if mode.startswith("自定义") and self.thumb_path:
+            return self.thumb_path
+        if mode == "自动":
+            return str(auto_thumb(src) or "")
+        if mode == "末尾一帧":
+            info = probe_info(src)
+            dur = float(info.get("duration") or 0)
+            png = WORK / "th-last.png"
+            return str(grab_frame(src, max(0.0, dur - 1.0), png, 640) or "")
+        return ""
+
+    def build_argv(self, src, outname, tpl, follow, thumb):
+        _name, br, xp, _tip = self.quality()
+        out = (self.out_dir() / outname).resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        argv = [str(src), "--out", str(out), "--template", tpl,
+                "--bitrate", br, "--preset", xp]
+        if thumb:
+            argv += ["--thumb-image", thumb]
+        if follow:
+            argv += ["--fps", "source"]
+        argv += ["--jobs", "0"]
+        self.used = {"bitrate": br, "preset": xp,
+                     "fps": "source" if follow else "59.94",
+                     "tpl": Path(tpl).name, "argv": " ".join(argv)}
+        return argv
+
+    def start_item(self, item, argv):
+        if self.cancel_asked:
+            return self.finish_queue()
+        out = (self.out_dir() / item["out"]).resolve()
+        tpl = argv[argv.index("--template") + 1]
+        self.tv.set(item["iid"], "st", "转换中")
+        self.done_file = None
+        steps = [(self.tools["conv"].main, "① 转换：" + item["src"].name)]
+        avs = [argv]
+        scripts = ["video-to-camera-mov.py"]
+        if self.var_verify.get():
+            steps.append((self.tools["verify"].main, "② 校验门禁：" + item["out"]))
+            avs.append([str(out), "--template", tpl])
+            scripts.append("verify-output.py")
+        self.launch(steps, argv=avs, scripts=scripts,
+                    done=lambda code, it=item: self.item_done(it, code))
+
+    def item_done(self, item, code):
+        CANCEL_FLAG.unlink(missing_ok=True)
+        ok = (code == 0) and not self.cancel_asked
+        if self.cancel_asked:
+            item["status"] = "已取消"
+            self.tv.set(item["iid"], "st", "已取消")
+            self.tv.item(item["iid"], tags=("",))
+            self.clean_work(item)
+            return self.finish_queue(cancelled=True)
+        if ok and (self.gate_ok or not self.var_verify.get()):
+            item["status"] = "完成" + ("·43/43" if self.gate_ok else "")
+            self.tv.set(item["iid"], "st",
+                        "完成 · 43/43" if self.gate_ok else "完成")
+            self.tv.item(item["iid"], tags=("ok",))
+        else:
+            self.fail += 1
+            item["status"] = "失败"
+            self.tv.set(item["iid"], "st", "失败")
+            self.tv.item(item["iid"], tags=("bad",))
+        self.qi += 1
+        self.bar.configure(value=self.qi / len(self.queue) * 100)
+        self.next_item()
+
+    def finish_queue(self, cancelled=False):
+        self.busy = False
+        self.btn_cancel.pack_forget()
+        self.btn_run.configure(state="normal")
+        if cancelled:
+            self.lbl_state.configure(text="已取消", fg=WARN)
+            self.set_state("idle")
             return
-        secs = self.var_thumb_sec.get() if self.var_thumb_mode.get() == "time" else 0.0
-        png = WORK / "preview.png"
-        cmd = [ffbin("ffmpeg"), "-y", "-v", "error", "-i", src]
-        if secs:
-            cmd += ["-ss", f"{secs:g}"]
-        cmd += ["-map", "0:v:0", "-vf",
-                "scale=384:216:force_original_aspect_ratio=decrease,"
-                "pad=384:216:(ow-iw)/2:(oh-ih)/2:color=black",
-                "-frames:v", "1", "-f", "image2", str(png)]
+        n = len(self.queue)
+        good = n - self.fail
+        if self.fail == 0:
+            self.lbl_state.configure(
+                text=f"全部完成 · {good}/{n}" + ("，门禁全过" if self.var_verify.get()
+                                                else ""), fg=OK)
+            self.bar.configure(value=100)
+            self.set_state("done")
+            self.show_post()
+        else:
+            self.lbl_state.configure(text=f"完成 {good}/{n}，失败 {self.fail}",
+                                     fg=DANGER)
+            self.set_state("idle")
+            self.show_post()
 
-        def job():
-            try:
-                subprocess.run(cmd, capture_output=True, timeout=120)
-                self.root.after(0, self.show_preview, png)
-            except Exception:
-                self.root.after(0, lambda: self.prev_img.configure(text="预览不可用"))
+    def show_post(self):
+        for w in self.f_post.winfo_children():
+            w.destroy()
+        for text, cb in (("打开文件夹", self.open_out), ("拷到相机卡", self.copy_last)):
+            tk.Button(self.f_post, text=text, command=cb, bg=BG, fg=ACCENT if
+                      text == "打开文件夹" else INK2, relief="flat", bd=0,
+                      font=F_SMALL, cursor="hand2").pack(side="left", padx=(0, 14))
+        self.f_post.pack(side="right", padx=(0, 14))
 
-        threading.Thread(target=job, daemon=True).start()
-
-    def show_preview(self, png):
-        try:
-            from PIL import Image, ImageTk
-            with Image.open(png) as im:
-                self._photo = ImageTk.PhotoImage(im.resize((192, 108),
-                                                           Image.LANCZOS))
-            self.prev_img.configure(image=self._photo, text="")
-        except Exception:
-            self.prev_img.configure(text="预览不可用（打包时缺 PIL.ImageTk？）")
-
-    # ---------- 日志 ----------
-    def log_write(self, text, tag=None):
-        self.log.configure(state="normal")
-        if tag is None:
-            tag = ("bad" if ("[!!]" in text or "[FAIL]" in text or "失败" in text
-                             or "异常" in text) else
-                   "ok" if ("[OK]" in text or "通过" in text) else
-                   "warn" if ("⚠" in text or "警告" in text) else
-                   "dim" if text.startswith("  [用时]") else "")
-        self.log.insert("end", text + "\n", tag)
-        self.log.see("end")
-        self.log.configure(state="disabled")
-
-    def log_clear(self):
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
-
-    def log_copy(self):
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.log.get("1.0", "end").strip())
-
-    def log_save(self):
-        p = filedialog.asksaveasfilename(defaultextension=".txt",
-                                         initialfile="转换日志.txt",
-                                         filetypes=[("文本", "*.txt")])
-        if p:
-            Path(p).write_text(self.log.get("1.0", "end"), encoding="utf-8")
-
-    # ---------- IO 重定向：把工具的 print 变成日志 + 进度 ----------
+    # ---------- 工具调用 ----------
     class _Sink(io.TextIOBase):
         def __init__(self, app):
             self.app = app
@@ -1016,234 +801,7 @@ class App:
                 line, self.buf = self.buf, ""
                 self.app.root.after(0, self.app.on_line, line)
 
-    def on_line(self, line):
-        """工具的一行输出：进度协议行进进度卡片，其余进日志。"""
-        if line.startswith("##CAMMOV "):
-            try:
-                self.on_event(json.loads(line[len("##CAMMOV "):]))
-            except Exception:
-                pass
-            return
-        if line.strip():
-            self.log_write(line)
-
-    def on_event(self, ev):
-        k = ev.get("k")
-        if k == "prog":
-            if ev.get("pct") is not None:
-                self.enc_pct = ev["pct"]
-            total, done, sp = ev.get("total"), ev.get("done"), ev.get("speed")
-            self.bar.configure(value=self.overall())
-            if self.enc_pct is not None:
-                self.lbl_pct.configure(text=f"{self.enc_pct:.1f}%")
-            self.stat_lbls["预计剩余"].configure(text=fmt_secs(ev.get("eta")))
-            if sp:
-                # 输出是多少 fps 就按多少换算，29.97 时别再拿 59.94 乘（会虚高一倍）
-                out_fps = 29.97 if self.fps_eff() == "source" else 59.94
-                self.stat_lbls["编码速度"].configure(
-                    text=f"{out_fps * sp:.1f} fps（{sp:.2f}×）")
-            if total:
-                self.stat_lbls["已处理 / 总时长"].configure(
-                    text=f"{fmt_secs(done)} / {fmt_secs(total)}")
-        elif k == "stage":
-            self.cur = ev.get("step", 0)
-            run = ev.get("running")
-            total = ev.get("total", 6)
-            if run:
-                self.lbl_stage.configure(text=f"第 {self.cur + 1}/{total} 步 · {run}")
-            self.bar.configure(value=self.overall())
-        elif k == "gate":
-            ok, bad = ev.get("ok", 0), ev.get("bad", 0)
-            self.gate_ok = (bad == 0 and (ok + bad) > 0)
-            self.log_write(f"[门禁] {ok}/{ok + bad} 项通过"
-                           + ("" if self.gate_ok else f"，未通过：{ev.get('failed')}"))
-            if self.gate_ok:
-                self.lbl_status.configure(text=f"门禁通过 {ok}/{ok + bad}")
-                self.lbl_stage.configure(text=f"门禁 {ok}/{ok + bad} 通过，可以拷到卡上")
-                self.sync_status()
-                self.set_state("done")
-        elif k == "done":
-            self.done_file = ev.get("out")
-            if ev.get("size"):
-                self.stat_lbls["输出大小"].configure(text=fmt_size(ev["size"]))
-        elif k == "cancelled":
-            self.log_write(f"[已取消] 编到第 {ev.get('at', '?')} 秒画面被停掉，"
-                           "中间文件已清理。")
-
-    def overall(self):
-        """总进度 = 已完成阶段的权重 + 当前阶段内部进度（编码用真实百分比）。"""
-        i = min(self.cur, len(STAGE_W) - 1)
-        frac = (self.enc_pct or 0) / 100.0 if i == 1 else 0.0
-        v = STAGE_CUM[i] + STAGE_W[i] * frac
-        return 100.0 if self.done_file else v
-
-    # ---------- 状态 ----------
-    def set_state(self, st):
-        self.state = st
-        if st == "idle":
-            self.badge.configure(text="空闲", bg=LINE2, fg=INK2)
-            # 空闲时把进度条和 5 格统计收掉：底部固定区矮一截，普通模式的
-            # 输入/参数两张卡在 150% 缩放的笔记本屏上也能一屏看全
-            self.bar.pack_forget()
-            self.stats.pack_forget()
-        elif st == "run":
-            self.badge.configure(text="转换中", bg=ACCENT_SOFT, fg=ACCENT)
-            self.bar.pack(fill="x", pady=(8, 4))
-            self.stats.pack(fill="x", pady=(4, 0))
-            self.lbl_pct.configure(text="")
-            self.bar.configure(value=0.0)
-        elif st == "done":
-            self.badge.configure(text="已完成", bg=OK_SOFT, fg=OK)
-            self.bar.pack(fill="x", pady=(8, 4))
-            self.stats.pack(fill="x", pady=(4, 0))
-            self.lbl_pct.configure(text="100%")
-            self.bar.configure(value=100.0)
-            self.canvas.yview_moveto(1.0)     # 完成后停在日志尾部（43/43 那几行）
-        busy = st == "run"
-        self.btn_go.configure(state="disabled" if busy else "normal")
-        self.btn_ver.configure(state="normal" if self.done_file else "disabled")
-        self.btn_copy.configure(
-            state="normal" if (self.gate_ok and self.done_file) else "disabled")
-        if busy:
-            self.btn_cancel.pack(side="left", padx=6)
-            self.canvas.yview_moveto(1.0)     # 转换时把日志区滚进视野
-        else:
-            self.btn_cancel.pack_forget()
-
-    # ---------- 运行工具 ----------
-    def out_path(self):
-        name = self.var_outname.get().strip() or "DSC_4600.MOV"
-        if not name.upper().endswith(".MOV"):
-            name += ".MOV"
-        return Path(self.var_outdir.get().strip() or ".") / name
-
-    def run_convert(self):
-        if self.tools.get("conv") is None:
-            return messagebox.showerror("错误", "转换模块没加载成功")
-        src = self.var_src.get().strip()
-        if not src or not Path(src).exists():
-            return messagebox.showerror("错误", "请先选择存在的输入视频")
-        tpl = self.var_tpl.get().strip()
-        if not Path(tpl).exists():
-            return messagebox.showerror("错误", f"模板不存在：{tpl}")
-        out = self.out_path()
-        if out.exists() and not messagebox.askyesno(
-                "覆盖？", f"{out}\n已经存在，要覆盖它吗？"):
-            return
-        out.parent.mkdir(parents=True, exist_ok=True)
-        br = self.var_bitrate.get().strip() or "15M"
-        xp = self.var_xpreset.get().strip() or "fast"
-        argv = [src, "--out", str(out), "--template", tpl,
-                "--bitrate", br, "--preset", xp]
-        # 缩略图（默认首帧 = 什么都不传，也就是相机原生行为）
-        mode = self.var_thumb_mode.get()
-        if self.var_nothumbs.get():
-            argv.append("--no-thumbs")
-        elif mode == "time":
-            argv += ["--thumb-at", f"{self.var_thumb_sec.get():g}"]
-        elif mode == "file":
-            img = self.var_thumb_img.get().strip()
-            if not img or not Path(img).exists():
-                return messagebox.showerror("错误", "选一张存在的图片当缩略图")
-            argv += ["--thumb-image", img]
-        # 高级模式的可选项；锁死的项（encoder/mdat/size）一律不传，用工具默认值
-        if self.var_mode.get() == "adv":
-            if self.var_noaudio.get():
-                argv.append("--no-audio")
-            if self.var_keep.get():
-                argv.append("--keep")
-            if self.var_time.get().strip() == "keep":
-                argv += ["--time", "keep"]
-            st, du = self.var_start.get().strip(), self.var_dur.get().strip()
-            if st:
-                argv += ["--start", st]
-            if du:
-                argv += ["--duration", du]
-
-        # 输出帧率：59.94 是工具默认（不传）；「跟随源」只在源确实是 30fps/29.97
-        # 时传 --fps source（那时工具会归一到相机的 30000/1001 时基）
-        if self.fps_eff() == "source":
-            argv += ["--fps", "source"]
-
-        # 分段并行 v2（GOP 对齐，段首 IDR 与单进程同位）：交给工具按时长/帧率
-        # 自动定段数（59.94→4 段、29.97→6 段，时长 <25 s 退单进程）。
-        # 6 段并行的产物 DSC_8965（5M/29.97）与 DSC_9700 已真机播放通过。
-        argv += ["--jobs", "0"]
-
-        # 记下「这次真正传出去的参数」，冒烟报告照抄这里。
-        # 报告读界面控件曾出现与真正编码不一致的取值（beta.2 前的 5M 假象），
-        # 报告只认实际 argv，才不会骗人。
-        self.used = {"bitrate": br, "preset": xp,
-                     "fps": "source" if self.fps_eff() == "source" else "59.94",
-                     "tpl": Path(tpl).name, "argv": " ".join(argv)}
-
-        self.done_file = None
-        self.gate_ok = False
-        self.start_job()
-        steps = [(self.tools["conv"].main, "① 转换：" + Path(src).name)]
-        # 转换完自动跑门禁（门禁全过才允许拷卡）
-        steps.append((self.tools["verify"].main,
-                      "② 校验门禁：" + str(out)))
-        self.launch(steps, argv=[argv, [str(out), "--template", tpl]],
-                    scripts=["video-to-camera-mov.py", "verify-output.py"])
-
-    def run_verify(self):
-        if self.tools.get("verify") is None:
-            return messagebox.showerror("错误", "校验模块没加载成功")
-        out = self.done_file or self.out_path()
-        if not Path(out).exists():
-            return messagebox.showerror("错误", f"找不到 {out}")
-        tpl = self.var_tpl.get().strip()
-        self.gate_ok = False
-        self.start_job()
-        self.launch([(self.tools["verify"].main, "② 校验门禁：" + Path(out).name)],
-                    argv=[[str(out), "--template", tpl]],
-                    scripts=["verify-output.py"])
-
-    def run_copy(self):
-        out = self.done_file or self.out_path()
-        if not Path(out).exists():
-            return messagebox.showerror("错误", f"找不到 {out}")
-        copy = load_tool("copy-to-card.py", "copycard")
-        self.start_job()
-        self.launch([(copy.main, "③ 拷到卡上：" + Path(out).name)],
-                    argv=[[str(out)]], scripts=["copy-to-card.py"])
-
-    def start_job(self):
-        CANCEL_FLAG.unlink(missing_ok=True)
-        self.cancel_asked = False
-        self.busy = True
-        self.cur = 0
-        self.enc_pct = None
-        self.t_start = time.time()
-        self.lbl_stage.configure(text="准备中…")
-        self.set_state("run")
-        self.lbl_status.configure(text="转换中")
-        self.bar.configure(value=0.0)
-        self.root.after(1000, self.tick)
-        # 窗口小的时候"进度/日志"在第一屏之外，直接滚下去
-        self.body.update_idletasks()
-        self.canvas.yview_moveto(1.0)
-
-    def tick(self):
-        """每秒更新已用时间与输出大小（编码中的 .265 中间文件在长）。"""
-        if not self.busy:
-            return
-        self.stat_lbls["已用时间"].configure(
-            text=fmt_secs(time.time() - self.t_start))
-        try:
-            stem = self.out_path().stem
-            f = WORK / f"enc-{stem}.265"
-            if f.exists():
-                self.stat_lbls["输出大小"].configure(text=fmt_size(f.stat().st_size))
-        except Exception:
-            pass
-        self.root.after(1000, self.tick)
-
-    def launch(self, steps, argv, scripts):
-        """在一个守护线程里依次跑若干工具 main()，共享日志与进度。"""
-        if not self.busy:
-            return
+    def launch(self, steps, argv, scripts, done):
         old_argv, old_out = sys.argv, sys.stdout
         sink = self._Sink(self)
 
@@ -1251,9 +809,8 @@ class App:
             code = 0
             try:
                 for (fn, title), av, sc in zip(steps, argv, scripts):
-                    self.root.after(0, self.log_write, "\n" + "=" * 68)
+                    self.root.after(0, self.log_write, "\n" + "=" * 64)
                     self.root.after(0, self.log_write, title)
-                    self.root.after(0, self.log_write, "=" * 68)
                     sys.argv = [sc] + list(av)
                     sys.stdout = sink
                     try:
@@ -1268,42 +825,56 @@ class App:
                     if code:
                         break
             except Exception:
-                self.root.after(0, self.log_write,
-                                "[异常]\n" + traceback.format_exc())
+                self.root.after(0, self.log_write, "[异常]\n" + traceback.format_exc())
                 code = 1
             finally:
                 sys.argv, sys.stdout = old_argv, old_out
-                self.root.after(0, self.job_done, code)
+                self.root.after(0, done, code)
 
         threading.Thread(target=job, daemon=True).start()
 
-    def job_done(self, code):
-        self.busy = False
-        CANCEL_FLAG.unlink(missing_ok=True)
-        # 取消只在"这一步真的失败了"时才算数：门禁阶段点取消不影响已经转好的文件
-        if self.cancel_asked and code != 0:
-            self.clean_work()            # 工具只在成功时自己清理中间文件
-            self.log_write("[已取消] 本次操作已取消")
-            self.lbl_status.configure(text="已取消")
-            self.lbl_stage.configure(text="已取消 · 可以重新开始")
-            self.set_state("idle")
+    def on_line(self, line):
+        if line.startswith("##CAMMOV "):
+            try:
+                self.on_event(json.loads(line[len("##CAMMOV "):]))
+            except Exception:
+                pass
             return
-        if code == 0:
-            self.log_write("[成功]")
-            if self.done_file:
-                self.stat_lbls["输出大小"].configure(
-                    text=fmt_size(Path(self.done_file).stat().st_size))
-        else:
-            self.log_write(f"[失败] 退出码 {code}")
-            self.lbl_status.configure(text="失败")
-        if self.gate_ok:
-            self.set_state("done")
-        elif self.done_file:
-            self.bar.configure(value=100.0)
-            self.set_state("idle")       # 转换成功但门禁没过：不允许拷卡
-        else:
-            self.set_state("idle")
-        self.sync_status()
+        if line.strip():
+            self.log_write(line)
+
+    def on_event(self, ev):
+        k = ev.get("k")
+        if k == "prog":
+            if ev.get("pct") is not None:
+                self.enc_pct = ev["pct"]
+            self.bar.configure(value=self.overall())
+            if self.cur_item:
+                self.tv.set(self.cur_item["iid"], "st",
+                            f"转换 {self.enc_pct or 0:.0f}%")
+            sp = ev.get("speed")
+            if sp and self.cur_item:
+                out_fps = 29.97 if self.used.get("fps") == "source" else 59.94
+                self.lbl_state.configure(
+                    text=f"{self.qi + 1}/{len(self.queue)} · "
+                         f"{out_fps * sp:.0f} fps（{sp:.2f}×） · 剩 "
+                         f"{fmt_secs(ev.get('eta'))}", fg=INK2)
+        elif k == "stage":
+            self.bar.configure(value=self.overall())
+        elif k == "gate":
+            ok, bad = ev.get("ok", 0), ev.get("bad", 0)
+            self.gate_ok = (bad == 0 and (ok + bad) > 0)
+            self.log_write(f"[门禁] {ok}/{ok + bad} 项通过"
+                           + ("" if self.gate_ok else f"，未通过：{ev.get('failed')}"))
+        elif k == "done":
+            self.done_file = ev.get("out")
+        elif k == "cancelled":
+            self.log_write(f"[已取消] 编到第 {ev.get('at', '?')} 秒画面被停掉。")
+
+    def overall(self):
+        n = max(1, len(getattr(self, "queue", []) or [1]))
+        frac = (self.enc_pct or 0) / 100.0
+        return min(100.0, (self.qi + frac) / n * 100.0)
 
     def cancel_job(self):
         if not self.busy:
@@ -1311,12 +882,10 @@ class App:
         self.cancel_asked = True
         CANCEL_FLAG.write_text("cancel", encoding="utf-8")
         self.log_write("[取消] 正在停 ffmpeg…")
-        self.lbl_stage.configure(text="正在取消…")
+        self.lbl_state.configure(text="正在取消…", fg=WARN)
 
-    def clean_work(self):
-        """收掉这一趟的中间文件。命名跟 tools/video-to-camera-mov.py 里一致
-        （enc-/seg-/th- 加输出名），工具只在成功收尾时自己清理，取消时要界面兜底。"""
-        tag = self.out_path().stem
+    def clean_work(self, item):
+        tag = Path(item["out"]).stem
         for pat in (f"enc-{tag}.265", f"enc-{tag}.pcm", f"seg-{tag}-*.265",
                     f"th-{tag}-*.png"):
             for f in WORK.glob(pat):
@@ -1326,26 +895,68 @@ class App:
                     pass
 
     def open_out(self):
-        d = Path(self.var_outdir.get().strip() or ".")
-        if not d.exists():                # 还没转过任何东西时目录可能还不存在
-            try:
-                d.mkdir(parents=True, exist_ok=True)
-            except OSError as e:
-                messagebox.showwarning("打开输出目录", f"目录不存在，也建不出来：\n{d}\n\n{e}")
-                return
-        os.startfile(d)          # noqa: S606
+        d = self.out_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(d)          # noqa: S606
+        except OSError as e:
+            messagebox.showwarning("打开输出目录", str(e))
+
+    def copy_last(self):
+        if not self.done_file or not Path(self.done_file).exists():
+            return
+        try:
+            copy = load_tool("copy-to-card.py", "copycard")
+        except Exception:
+            return messagebox.showerror("错误", "拷卡模块加载失败")
+        old = sys.argv
+        sys.argv = ["copy-to-card.py", str(self.done_file)]
+        try:
+            copy.main()
+        except SystemExit as e:
+            self.log_write(f"[拷卡] 退出码 {e.code}")
+        finally:
+            sys.argv = old
+
+    # ---------- 状态 / 日志 ----------
+    def set_state(self, st):
+        self.state = st
+        busy = st == "run"
+        self.btn_run.configure(state="disabled" if (busy or not self.items)
+                               else "normal")
+
+    def log_write(self, text, tag=None):
+        self.log.configure(state="normal")
+        if tag is None:
+            tag = ("bad" if ("[!!]" in text or "[FAIL]" in text or "失败" in text
+                             or "异常" in text) else
+                   "ok" if ("[OK]" in text or "通过" in text) else
+                   "warn" if ("⚠" in text or "警告" in text) else "")
+        self.log.insert("end", text + "\n", tag)
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
 
 
 def selftest(report=None):
-    """无人工介入的界面自检：能不能建起来、有没有异常。
-    --windowed 打包后没有控制台，所以结果同时落到 --report 指定的文件。"""
     headless_modals()
     root = tk.Tk()
     app = App(root)
     n = len(root.winfo_children())
 
     def fin():
-        text = f"UI OK：顶层子控件 {n} 个、{len(app.stat_lbls)} 格统计"
+        have = [k for k in ("conv", "verify", "split") if app.tools.get(k)]
+        miss = [k for k in ("conv", "verify", "split") if not app.tools.get(k)]
+        try:
+            load_tool("copy-to-card.py", "copycard")
+            extra = " / copy 能加载"
+        except Exception:
+            extra = " / copy 加载失败"
+        app.add_paths([Path(__file__)])          # 队列能进条目
+        text = (f"UI OK：顶层子控件 {n} 个、队列 {len(app.items)} 条 | "
+                f"画质 {app.quality()[0]} | 校验 {app.var_verify.get()} | "
+                f"工具: {'+'.join(have) or '无'}"
+                + (f"（缺 {'+'.join(miss)}）" if miss else "") + extra)
         if report:
             Path(report).write_text(text + "\n", encoding="utf-8")
         print(text)
@@ -1356,7 +967,6 @@ def selftest(report=None):
 
 
 def headless_modals():
-    """冒烟测试里没人点按钮，也不能被模态框挡住：换成记录。"""
     def rec(*a, **_k):
         NOTES.append("[弹窗] " + " ".join(str(x) for x in a))
 
@@ -1366,75 +976,60 @@ def headless_modals():
 
 
 NOTES = []
-AUTO_TIMEOUT = 3600          # 秒；纯保险，正常几十秒就完
+AUTO_TIMEOUT = 3600
 
 
 def auto_smoke():
-    """冻结后的端到端冒烟测试：没人点按钮也把「① 转换 + ② 门禁」跑完，
-    结果写进 --report 文件（--windowed 的 exe 没有 stdout 可看）。
-
-        app.exe --auto <源视频> --outdir <目录> --outname DSC_4700.MOV
-                --report <结果文件> [--fps-mode 59.94|source]
-
-    --fps-mode source 会走界面的「跟随源」那条路（列表选 29.97、换 30fps 模板），
-    用来冒烟 30fps 通道。
-    """
+    """端到端冒烟：走真实队列把「① 转换 + ② 门禁」跑完，结果写进 --report。"""
     a = sys.argv
     src = a[a.index("--auto") + 1]
+    src2 = a[a.index("--auto2") + 1] if "--auto2" in a else ""
     outdir = a[a.index("--outdir") + 1] if "--outdir" in a else str(Path(src).parent)
     name = a[a.index("--outname") + 1] if "--outname" in a else "DSC_4700.MOV"
-    report = Path(a[a.index("--report") + 1]) if "--report" in a else WORK / "auto-report.txt"
-    want_fps = a[a.index("--fps-mode") + 1].lower() if "--fps-mode" in a else ""
+    report = Path(a[a.index("--report") + 1]) if "--report" in a else WORK / "auto.txt"
+    quality = a[a.index("--quality") + 1] if "--quality" in a else "1"
 
     headless_modals()
     t0 = time.time()
     root = tk.Tk()
     app = App(root)
-    app.var_src.set(str(Path(src).resolve()))
     app.var_outdir.set(outdir)
-    app.var_outname.set(name)
-    # 同步探一次，这样「跟随源」能不能生效当场就定了
-    app.src_probe = App.probe_info(str(Path(src).resolve()))
-    app.show_srcinfo(app.src_probe)
-    if want_fps:
-        for text, key in FPS_CHOICES:
-            if key == ("" if want_fps.startswith("59") else want_fps):
-                app.var_fps.set(text)
-                break
-        app.on_fps()
-    app.probe_src()
-    state = {"ok": False, "why": "超时"}
+    try:
+        app.var_quality.set(int(quality))
+    except Exception:
+        pass
+    app.seq = int(Path(name).stem.split("_")[1]) - 1 if "_" in name else 0
+    app.add_paths([Path(src).resolve()])
+    app.items[-1]["out"] = name
+    app.tv.set(app.items[-1]["iid"], "out", name)
+    if src2:
+        app.seq = int(Path(name).stem.split("_")[1])
+        app.add_paths([Path(src2).resolve()])
+    state = {"ok": False}
 
     def write_report(success):
-        out = app.done_file or str(app.out_path())
-        try:                       # 拷卡模块是懒加载的，顺手确认打包后也能加载
-            load_tool("copy-to-card.py", "copycard")
-            copy_ok = "能加载"
-        except Exception as e:
-            copy_ok = f"加载失败：{e}"
-        u = getattr(app, "used", None) or {}
+        u = app.used or {}
+        done = [it["out"] for it in app.items if it["status"] != ""]
         lines = [
             f"结果       : {'成功' if success else '失败'}",
             f"用时       : {time.time() - t0:.0f}s",
-            f"输入       : {app.var_src.get()}",
-            f"输出       : {out}",
-            f"输出存在   : {Path(out).exists()}"
-            + (f"（{Path(out).stat().st_size:,} B）" if Path(out).exists() else ""),
+            f"输入       : {src}" + (f" + {src2}" if src2 else ""),
+            f"输出目录   : {outdir}",
+            f"输出       : {', '.join(done)}",
+            "输出存在   : " + ", ".join(
+                f"{it['out']}={Path(outdir, it['out']).exists()}"
+                for it in app.items),
             f"界面状态   : {app.state}   门禁通过: {app.gate_ok}",
-            "输出帧率   : " + (("29.97（跟随源）" if u.get("fps") == "source"
-                                else "59.94") if u else app.fps_text())
-            + "   模板: " + (u.get("tpl") or Path(app.var_tpl.get()).name),
-            "码率/预设  : " + (f"{u.get('bitrate')} / {u.get('preset')}" if u
-                               else f"{app.var_bitrate.get()} / "
-                                    f"{app.var_xpreset.get()}（未跑转换）"),
-            f"实际参数   : {u.get('argv', '（未跑转换）')}",
-            f"拷卡模块   : {copy_ok}",
-            f"按钮       : ①{app.btn_go.cget('state')} ②{app.btn_ver.cget('state')}"
-            f" ③{app.btn_copy.cget('state')}",
-            "统计       : " + str({k: v.cget("text") for k, v in app.stat_lbls.items()}),
-            "阶段行     : " + app.lbl_stage.cget("text"),
-            "左下状态   : " + app.lbl_status.cget("text"),
-            "右下状态   : " + app.lbl_tpl.cget("text"),
+            "输出帧率   : " + ("29.97（跟随源）" if u.get("fps") == "source"
+                              else "59.94") + "   模板: " + (u.get("tpl") or "-"),
+            "码率/预设  : " + (f"{u.get('bitrate')} / {u.get('preset')}" if u else "-"),
+            f"实际参数   : {u.get('argv', '-')}",
+            "工具       : " + " / ".join(
+                f"{k}{'OK' if app.tools.get(k) else '缺'}"
+                for k in ("conv", "verify", "split")),
+            "队列       : " + " | ".join(f"{it['out']}:{it['status']}"
+                                        for it in app.items),
+            "状态行     : " + app.lbl_state.cget("text"),
             "弹窗       : " + ("；".join(NOTES) if NOTES else "无"),
             "--- 日志（末尾 20 行）---",
         ]
@@ -1447,9 +1042,7 @@ def auto_smoke():
         print("\n".join(lines))
 
     def go():
-        state["why"] = "转换已启动"
-        app.run_convert()
-        state["why"] = "转换中"
+        app.run_queue()
 
     def watch():
         if app.busy:
@@ -1459,8 +1052,7 @@ def auto_smoke():
                 return
             root.after(500, watch)
             return
-        state["ok"] = bool(app.gate_ok and app.done_file)
-        state["why"] = "结束"
+        state["ok"] = app.fail == 0 and (app.gate_ok or not app.var_verify.get())
         write_report(state["ok"])
         root.destroy()
 
@@ -1473,11 +1065,8 @@ def auto_smoke():
 def main():
     root = tk.Tk()
     app = App(root)
-    # 拖到 exe / 脚本上的文件（argv[1]）自动填入
     if len(sys.argv) > 1 and Path(sys.argv[1]).exists():
-        app.var_src.set(str(Path(sys.argv[1]).resolve()))
-        app.probe_src()
-        app.make_preview()
+        app.add_paths([Path(sys.argv[1]).resolve()])
     root.mainloop()
 
 
@@ -1485,6 +1074,7 @@ if __name__ == "__main__":
     if "--auto" in sys.argv:
         auto_smoke()
     elif "--selftest" in sys.argv:
-        selftest(sys.argv[sys.argv.index("--report") + 1] if "--report" in sys.argv else None)
+        selftest(sys.argv[sys.argv.index("--report") + 1]
+                 if "--report" in sys.argv else None)
     else:
         main()

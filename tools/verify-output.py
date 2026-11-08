@@ -25,8 +25,7 @@ _s = importlib.util.spec_from_file_location("cj", HERE / "camera-jpeg.py")
 cj = importlib.util.module_from_spec(_s)
 _s.loader.exec_module(cj)
 
-from binpath import FFMPEG, FFPROBE
-FFPROBE = FFMPEG.replace("ffmpeg.exe", "ffprobe.exe")
+from binpath import FFMPEG
 
 OK, BAD = [], []
 
@@ -91,6 +90,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("output")
     ap.add_argument("--template", required=True)
+    ap.add_argument("--extra", action="store_true",
+                    help="附加跑 tools/nikon-box-audit.py 的「尼康子集」审查（不改变 43 项门禁语义）")
     a = ap.parse_args()
     out, tmpl = Path(a.output), Path(a.template)
     if not out.exists():
@@ -145,7 +146,10 @@ def main():
     _delta = u32(d, _stts0[0] + 20) or 1
     _fps = _vts / _delta
     _want_v = max(1, round(_fps / 2))          # 0.5 秒多少帧
-    _want_a = int(_want_v * _delta / _vts * 48000 + 1e-9)   # 0.5 秒多少音频样本
+    # ★ 这里也必须整数运算：原来两处都写成 int(… * 48000 + 1e-9)，写入端与检查端
+    #   犯同一个浮点错误 → 门禁看不见 ±1 跳块（只查中位数就更看不见了）。
+    #   29.97 长片的音频块会在 24,023/24,024/24,025 间跳，正是「快进不夹紧」的强相关项。
+    _want_a = _want_v * _delta * 48000 // _vts   # 0.5 秒多少音频样本
     for _i, (_tr, _nm) in enumerate(((v, "视频"), (trs[1], "音频"))):
         _stbl = find(d, _tr[0], _tr[0] + _tr[2], b"stbl")
         _sc = find(d, _stbl[0], _stbl[0] + _stbl[2], b"stsc")
@@ -170,9 +174,13 @@ def main():
             check(sum(_per) == _cnt, f"{_nm} stsc 展开样本数 == stsz 计数",
                   f"{sum(_per):,} vs {_cnt:,}")
             _want = _want_v if _i == 0 else _want_a
-            check(_md == _want or (len(_per) > 1 and sorted(_per)[-2] == _want),
-                  f"{_nm}分块尺寸 == 0.5 秒（应为 {_want:,}）",
-                  f"中位 {_md:,}")
+            # ★ 相机原片是「除末块外每块都一样」；这里就按这个标准查，
+            #   不再只看中位数（只看中位数会放过 ±1 跳块的长片）。
+            _head = _per[:-1] if len(_per) > 1 else list(_per)
+            _off = [x for x in _head if x != _want]
+            check(not _off,
+                  f"{_nm}每块 == 0.5 秒（应为 {_want:,}；末块除外）",
+                  f"{len(_off):,}/{len(_head):,} 块不符" + (f"，例如 {_off[:3]}" if _off else ""))
 
     # ---- 3) 时长自洽 ----
     print("\n[3] 时长自洽")
@@ -182,8 +190,10 @@ def main():
     # （那会把 mdia 自己当成第一个同级盒，与类型不符就直接跳过去了）
     vmd = find(d, v[0], v[0] + v[2], b"mdhd")
     vts, vdur = u32(d, vmd[0] + 20), u32(d, vmd[0] + 24)
-    a = trs[1]
-    amd = find(d, a[0], a[0] + a[2], b"mdhd")
+    # 注意：这里原来写成 `a = trs[1]`，把 argparse 的名字空间 a 覆盖成了音频轨 ——
+    # 只要后面再读 a.<任何参数>（例如 --extra）就会 AttributeError。改成 atr。
+    atr = trs[1]
+    amd = find(d, atr[0], atr[0] + atr[2], b"mdhd")
     ats, adur = u32(d, amd[0] + 20), u32(d, amd[0] + 24)
     sec_movie = mdur / mts
     sec_video = vdur / vts
@@ -196,7 +206,7 @@ def main():
     #    tkhd.duration 全都是模板 DSC_8955 的 228228 / 228220；
     #    所有把它改成正确值的文件，快进超过末尾时相机**不夹紧 → 卡死**。
     #    DSC_4521 vs DSC_4555 全文件只差这 6 个字节，行为随之翻转。
-    for _i, (_tr, _nm) in enumerate(((v, "视频"), (a, "音频"))):
+    for _i, (_tr, _nm) in enumerate(((v, "视频"), (atr, "音频"))):
         _tk = find(d, _tr[0], _tr[0] + _tr[2], b"tkhd")
         _ttk = find(t, ttrs[_i][0], ttrs[_i][0] + ttrs[_i][2], b"tkhd")
         _tdu = u32(d, _tk[0] + 28) if d[_tk[0] + 8] == 0 else u32(d, _tk[0] + 36)
@@ -369,7 +379,25 @@ def main():
         {"k": "gate", "ok": len(OK), "bad": len(BAD),
          "total": len(OK) + len(BAD), "failed": BAD}, ensure_ascii=False),
         flush=True)
-    return 1 if BAD else 0
+    # ---- 附加：尼康子集审查（可选，不参与上面的 43 项门禁计数）----
+    # 依据：WonderLantern/z9-qemu 的 tools/isobmff_raw_index.py 所接受的子集
+    #（那份解析器专门读固件自己写出的电影）。独立实现、不复用 boxio，所以能反过来
+    # 验证我们的工具；细节见 tools/nikon-box-audit.py 与 docs/尼康ISO-BMFF子集-参考.md。
+    extra_bad = 0
+    if a.extra:
+        print("\n[附加] 尼康子集审查（tools/nikon-box-audit.py，独立实现）")
+        r = subprocess.run([sys.executable, str(HERE / "nikon-box-audit.py"), a.output],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        for line in (r.stdout or "").splitlines():
+            # 保留 nikon-box-audit 的 ##CAMMOV 行，方便上游按机器可读方式取附加结论
+            print(line if line.startswith("##CAMMOV") else "  " + line)
+        if (r.stderr or "").strip():
+            print("  " + (r.stderr or "").strip().replace("\n", "\n  "))
+        m = re.search(r'"bad": (\d+)', r.stdout or "")
+        extra_bad = int(m.group(1)) if m else 1
+        print(f"  （附加审查未通过 {extra_bad} 项；上面的门禁结论仍是 {len(OK)}/{len(OK) + len(BAD)}）")
+
+    return 1 if (BAD or extra_bad) else 0
 
 
 if __name__ == "__main__":

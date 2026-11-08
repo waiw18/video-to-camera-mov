@@ -661,7 +661,16 @@ def build(es_path, out_path, template, mdat=None, drop_udta=False, audio_pcm=Non
     a_per, prev, cum_v = [], 0, 0
     for k in range(len(v_per)):
         cum_v += v_per[k]
-        cum = min(n_audio, int(cum_v * fps_den / fps_num * 48000 + 1e-9))
+        # ★★ 必须用整数运算 ★★
+        # 原来写的是 int(cum_v * fps_den / fps_num * 48000 + 1e-9)：那个 1e-9 只够抵消
+        # 小 k 的浮点误差。实测（复算脚本 .probe/_thresh.py，三种帧率结果完全一样）：
+        #   **从第 1022 块 = 512.0 秒开始出现 ±1 偏差**，之后约 7.6% 的块偏 1 个样本
+        #   （累计样本约 2.46×10^7 时 ULP 超过 1e-9，+1e-9 就补不回来了）。
+        # 后果：音频块在 24,023 / 24,024 / 24,025 之间跳，stsc 从 1~2 条涨到几百条，
+        # 而相机自己的原片一律是整齐的 24,024（stsc 只 1~2 条）。
+        # 这与「相机能播、但快进不夹紧」实测完全吻合：8.5 分钟以内的文件（含 254 s 的
+        # DSC_4521 ✓、5 s 的 DSC_9710 ✓）全部整齐；>8.5 分钟的 29.97 长片全部带跳块。
+        cum = min(n_audio, (cum_v * fps_den * 48000) // fps_num)
         a_per.append(max(0, cum - prev))
         prev = cum
     if prev < n_audio:

@@ -40,8 +40,13 @@ $firstSeen = $null
 foreach ($c in $cands) {
     if (-not $c -or -not (Test-Path $c)) { continue }
     if (-not $firstSeen) { $firstSeen = $c }
-    & $c -c "import PyInstaller, PIL" 2>$null
-    if ($LASTEXITCODE -eq 0) { $PY = $c; break }
+    # 解释器缺模块时会把 traceback 写到 stderr，Stop 模式下会被当成终止错误，先放宽
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & $c -c "import PyInstaller, PIL" 2>&1 | Out-Null
+    $rc = $LASTEXITCODE
+    $ErrorActionPreference = $old
+    if ($rc -eq 0) { $PY = $c; break }
 }
 if (-not $PY) {
     Write-Host "  以下解释器都没有 PyInstaller/Pillow："
@@ -77,6 +82,7 @@ $TOOL_FILES = @(
     'video-to-camera-mov.py',   # 转换主程序（被 app\main.py 加载）
     'verify-output.py',         # 43 项门禁
     'copy-to-card.py',          # 拷卡
+    'split-m4s.py',             # DASH 音视频合并 + 切段（界面「③ 分片」用）
     'make-camera-mov.py',       # 上面三个的依赖：装相机 MOV 容器
     'camera-jpeg.py',           #   相机规格 JPEG（缩略图）
     'binpath.py',               #   找 ffmpeg/ffprobe（认 CAMMOV_FFMPEG 等环境变量）
@@ -107,17 +113,34 @@ $common = @(
 )
 foreach ($t in $TOOL_FILES) { $common += @('--add-data', "tools\$t;tools") }
 
+# PyInstaller 把 INFO 日志写到 stderr；脚本开头是 ErrorActionPreference=Stop，
+# 原生程序的 stderr 会被 PowerShell 当成终止错误（NativeCommandError）。
+# 所以这一步临时放宽，并把 stderr 并进 stdout 一起打印。
+function Invoke-PyInstaller([string[]]$piArgs) {
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $PY -m PyInstaller @piArgs 2>&1 | ForEach-Object { Write-Host $_ } }
+    finally { $ErrorActionPreference = $old }
+    return $global:LASTEXITCODE
+}
+
 Write-Host "`n== 1/2 打包 --onedir（推荐）=="
-& $PY -m PyInstaller @common --onedir --windowed --name $NAME app\main.py
-if ($LASTEXITCODE -ne 0) { throw "onedir 打包失败" }
+$piArgs = $common + @('--onedir', '--windowed', '--name', $NAME, 'app\main.py')
+$code = Invoke-PyInstaller $piArgs
+if ($code -ne 0) { throw "onedir 打包失败（退出码 $code）" }
 
 Write-Host "`n== 2/2 打包 --onefile（单文件）=="
-& $PY -m PyInstaller @common --onefile --windowed --name "$NAME-单文件" app\main.py
-if ($LASTEXITCODE -ne 0) { throw "onefile 打包失败" }
+$piArgs = $common + @('--onefile', '--windowed', '--name', "$NAME-单文件", 'app\main.py')
+$code = Invoke-PyInstaller $piArgs
+if ($code -ne 0) { throw "onefile 打包失败（退出码 $code）" }
 
 Write-Host "`n== 产出 =="
-Get-ChildItem "$ROOT\dist" -Recurse -Filter *.exe |
-    Select-Object FullName, @{n='MB'; e={[math]::Round($_.Length/1MB,1)}} | Format-Table -AutoSize
+# 这里不要用 Format-Table：前面 Write-Host 已经把格式对象写进管道，
+# Stop 模式下再混一个 format-* 会抛 ConsoleLineOutputOutOfSequencePacket。
+Get-ChildItem "$ROOT\dist" -Recurse -Filter *.exe | ForEach-Object {
+    Write-Host ("  {0,-46} {1,7:N1} MB" -f $_.FullName.Replace("$ROOT\", ""),
+                ($_.Length / 1MB))
+}
 
 Write-Host @"
 
@@ -135,7 +158,7 @@ Write-Host @"
 == 打包后必查 ==
   - dist\...\_internal\bin\ 下要有 ffmpeg.exe 与 ffprobe.exe
   - dist\...\_internal\templates\ 下要有两个模板：DSC_8955.MOV（59.94）与 DSC_8960.MOV（29.97）
-  - dist\...\_internal\tools\ 里只该有那 8 个 .py（多出来就是又把实验脚本打进去了）
+  - dist\...\_internal\tools\ 里只该有那 9 个 .py（多出来就是又把实验脚本打进去了）
   - 在**没装 Python、没装 ffmpeg** 的机器上跑一次（这是测试版的意义）
   - 两种帧率各冒烟一次：--fps-mode source 与默认（59.94），报告里模板名要跟着变
 "@

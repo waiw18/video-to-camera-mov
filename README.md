@@ -19,28 +19,33 @@
 
 ---
 
-## 下载（测试版 v0.1.0-beta.2）
+## 下载（测试版 v0.1.0-beta.3）
 
 Windows 10/11 x64，**不需要装 Python 或 ffmpeg**（ffmpeg/x265 已打进包里）：
 
-- [video-to-camera-mov-v0.1.0-beta.2-win64.zip](../../releases/download/v0.1.0-beta.2/video-to-camera-mov-v0.1.0-beta.2-win64.zip)
+- [video-to-camera-mov-v0.1.0-beta.3-win64.zip](../../releases/download/v0.1.0-beta.3/video-to-camera-mov-v0.1.0-beta.3-win64.zip)
   —— **推荐**：解压得到「相机视频转换器」文件夹（约 400 MB），启动快、好排错
-- [video-to-camera-mov-v0.1.0-beta.2-onefile.exe](../../releases/download/v0.1.0-beta.2/video-to-camera-mov-v0.1.0-beta.2-onefile.exe)
+- [video-to-camera-mov-v0.1.0-beta.3-onefile.exe](../../releases/download/v0.1.0-beta.3/video-to-camera-mov-v0.1.0-beta.3-onefile.exe)
   —— 只有一个文件，第一次启动要解压临时目录，慢一些
 - `template-59.94-DSC_8955.MOV` / `template-29.97-DSC_8960.MOV`
   —— 两个相机模板单独也放了附件（zip 里本来就有），自己打包时放进 `templates\`
 
-发布页：<https://github.com/waiw18/video-to-camera-mov/releases/tag/v0.1.0-beta.2>
-发布说明：[docs/发布说明-v0.1.0-beta.2.md](docs/发布说明-v0.1.0-beta.2.md)
-测试指引：[docs/测试指引-v0.1.0-beta.2.md](docs/测试指引-v0.1.0-beta.2.md)（包内的 `测试指引.txt` 是同一份）
+发布页：<https://github.com/waiw18/video-to-camera-mov/releases/tag/v0.1.0-beta.3>
+发布说明：[docs/发布说明-v0.1.0-beta.3.md](docs/发布说明-v0.1.0-beta.3.md)
+测试指引：[docs/测试指引-v0.1.0-beta.3.md](docs/测试指引-v0.1.0-beta.3.md)（包内的 `测试指引.txt` 是同一份）
 
 > **码率**：15 Mbps 是推荐值；**5 Mbps 也真机验证可播**（2026-10-07，`DSC_8965`，43/43）。
 > 早先"8 Mbps 相机不认"的记录**已作废**——那次没留下产物或日志，原因未查清、后来也没复现过。
 
-图形界面里是三步：**① 开始转换 → ② 校验门禁（必须 43/43）→ ③ 拷到卡上**，
-转换中显示阶段、进度、编码速度和预计剩余时间。请按测试指引走一遍，
+图形界面 v0.1.0-beta.3 起只有两块：**① 来源（选择视频 / 合并视频 + 批量列表）→ ② 画质
+（小体积 5 Mbps / 推荐 15 Mbps / 高画质 40 Mbps + 「转换完自动校验」）**，底部一条进度与
+「开始转换」，跑完才出现「打开文件夹 / 拷到相机卡」。没有高级模式：真机锁定的项本来也不能改，
+模板 / 封面 / 分段折进「更多选项 ▾」，日志默认收起。一次可以排多个文件，逐个转换、逐个校验，
+每行显示「排队 → 转换 45% → 完成 · 43/43」，底部总进度按完成数算，全程可取消。
+输出帧率不用选：源是 30fps/29.97 自动按 29.97 输出，其余 59.94。
+请按测试指引走一遍，
 回传结果的方式也写在里面。包内还有一个 `自检.cmd`：把一段短视频拖到它上面，
-就会自动跑三步自检（界面 → 59.94 流程 → 「跟随源」流程）并把结果写成报告
+就会自动跑三步自检（界面 → 单文件 59.94 流程 → 两个文件的批量流程）并把结果写成报告
 （不需要人盯着点界面）；报告里的 `实际参数` 一行是程序真正传给转换核心的命令行。
 
 ---
@@ -157,19 +162,23 @@ python tools/copy-to-card.py --list
 
 ## 图形界面与打包
 
-- `app/main.py` —— tkinter 图形界面：普通模式（真机验证过的配方）/ 高级模式（每项可调），
-  底部有进度、编码速度、预计剩余时间与日志；三步走 **① 转换 → ② 校验门禁 → ③ 拷到卡上**。
-  界面里可选**输出帧率**（`59.94 · 相机原生` / `跟随源`）和三档码率预设（15M / 5M / 40M），
-  并行段数走 `--jobs 0` 自动值。另外带两个不需要人盯的自检入口
-  （`--windowed` 打包后没有控制台，结果写进报告文件）：
+- `app/main.py` —— tkinter 图形界面（v0.1.0-beta.3 重做）：两张卡 + 一条状态栏，
+  **没有高级模式**。① 来源 = 「选择视频 / 合并视频」页签 + 批量任务列表（输出名自动接
+  `DSC_####` 最大编号）；② 画质 = 三行列表（5M / 15M / 40M）+「转换完自动校验（43 项门禁）」；
+  底部进度条 + 状态行 + 开始/取消，跑完才出现「打开文件夹 / 拷到相机卡」。
+  队列逐个执行，每行显示「排队 → 转换 N% → 完成 · 43/43」；输出帧率按源自动判定
+  （30fps/29.97 → `--fps source` + 29.97 模板，其余 59.94），并行段数走 `--jobs 0`。
+  「更多选项 ▾」里是模板 / 封面（默认自动：首帧纯色时退到第一个有内容的帧）/ 分段。
+  另外带两个不需要人盯的自检入口（`--windowed` 打包后没有控制台，结果写进报告文件）：
   - `--selftest --report <文件>`：只把界面起起来，写一份控件自检报告后退出
-  - `--auto <源视频> --outdir <目录> --outname DSC_0001.MOV --report <文件> [--fps-mode source]`：
-    整套转换 + 门禁跑一遍
+  - `--auto <源视频> --outdir <目录> --outname DSC_0001.MOV --report <文件>
+    [--auto2 <第二个源>] [--quality 0|1|2]`：整套转换 + 门禁跑一遍（`--auto2` 顺便冒烟队列）
 - `app/build-exe.ps1` —— 用 PyInstaller 打包成 `dist\相机视频转换器\`（onedir）与单文件 exe
 - 打包需要：装了 **PyInstaller + Pillow** 的 Python（可用 `CAMMOV_PYTHON` 指定）、
   `ffmpeg`/`ffprobe`、以及**你自己相机录的同规格模板**：`templates\DSC_8955.MOV`（59.94）
   与 `templates\DSC_8960.MOV`（29.97）（媒体文件不进仓库，必须自备）
 - `design/前端设计稿-v1.html` —— 界面设计稿（双击可看，带三种状态的静态预览）
+- `design/界面原型-v3-*.png` —— v0.1.0-beta.3 界面的三张截图（批量列表 / 合并视频 / 转换中）
 
 ---
 
@@ -218,7 +227,10 @@ python tools/copy-to-card.py --list
 - **[docs/MOV与MP4结构差异.md](docs/MOV与MP4结构差异.md)** —— 容器格式差异
 - **[docs/工作记录-2026-10-07-GUI30fps.md](docs/工作记录-2026-10-07-GUI30fps.md)** —— 30fps 进图形界面这轮的工作记录
 - **[docs/工作记录-2026-10-07-彻夜之歌6部转卡.md](docs/工作记录-2026-10-07-彻夜之歌6部转卡.md)** —— 23.976 源批量转卡、长片容器修复与「不夹紧」现象记录
-- **[docs/发布说明-v0.1.0-beta.2.md](docs/发布说明-v0.1.0-beta.2.md)** / **[docs/测试指引-v0.1.0-beta.2.md](docs/测试指引-v0.1.0-beta.2.md)** —— 这一版的发布说明与一页纸测试指引
+- **[docs/发布说明-v0.1.0-beta.3.md](docs/发布说明-v0.1.0-beta.3.md)** / **[docs/测试指引-v0.1.0-beta.3.md](docs/测试指引-v0.1.0-beta.3.md)** —— 这一版（界面重做 + 29.97 长片音频分块修复）的说明与一页纸测试指引
+- **[docs/交接文档.md](docs/交接文档.md)** —— 相机硬约束、非显然取舍、门禁与常见坑（接手先读这份）
+- **[docs/尼康ISO-BMFF子集-参考.md](docs/尼康ISO-BMFF子集-参考.md)** —— 从 Nikon 固件模拟器项目吸收的容器子集约束与证据纪律
+- **[docs/相机固件-调研与取舍.md](docs/相机固件-调研与取舍.md)** —— 相机固件逆向项目调研、哪些用得上、哪些不走
 
 ---
 
